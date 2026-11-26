@@ -1,0 +1,6 @@
+{
+  "global": {
+    "cmd-alt-t": "mod.open:tsbridge",
+    "ctrl-shift-y": "mod.open:tsbridge"
+  }
+}

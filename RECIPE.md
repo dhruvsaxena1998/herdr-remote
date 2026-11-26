@@ -1,42 +1,55 @@
 # Tailcat bridge
 
-A dialog that connects Herdr to herdr-core on another machine (a Windows VM, another laptop) over Tailcat, Tailscale's data plane with no account, instead of SSH. The same dialog runs on both sides: one machine serves, the other adds it as an `hc` machine.
+A dialog that connects Herdr to herdr-core on another computer (a Windows VM, another laptop) over Tailcat, Tailscale's data plane with no account, instead of SSH. The same dialog runs on both computers. Pairing takes one string: the sharing computer's invite code, pasted on the other one, which then asks to connect; the sharing computer approves it by a short pairing code.
 
 ![Tailcat bridge](preview.png)
 
 ## What you see
 
-A 600×520 dialog on `popover`, 18px padding, 13px text. The title, **Tailcat bridge**, is 13.5px semibold `foreground`, with a 12px `muted` line under it. Below it are sections, each with a 1px `border` line on top and 12px above its content.
+A 600×560 dialog on `popover`, 18px padding, 13px text, scrolling when taller. A header row: **Tailcat bridge** (15px semibold) and a `dim` **Esc** chip that closes it (so does the Escape key). Under it, a 12px `muted` line: "Use your other computers' terminals right here. No SSH or VPN needed."
 
-Until the binary is in place, one section explains where `herdr-tsbridge v0.1.0` will be saved and shows a **Download** button.
+**Until the helper is in place**, one card on `background` titled **One-time setup** says what `herdr-tsbridge v0.2.0` is and where it goes, with **Download**. If an older or different binary is there, the card is **An update is needed** with **Update**. While downloading, a spinning `working` icon and "Downloading…" replace the button.
 
-After that, two sections:
+**After that, one page with two parts:**
 
-1. **Connect to a machine.** This machine's client key (`nodekey:…`) in a 12px box on `background` with a **Copy** button. Then a full-width field for the `tc…` address, and a name field with **Add machine**.
-2. **Let machines connect here.** A warning line that every allowed key gets full control of the machine. A field for allowed keys (comma-separated) with **Start**, which becomes **Stop** while serving. A status line: `dim` "Not serving." or `working` "Serving (herdr-core terminal tsbridge-serve)…". While serving, the `tc…` address with **Copy**, and a `dim` note that it is secret.
+1. **Your computers** (13.5px semibold) with an **Add a computer** button (primary) on the right.
+   - One row per computer added through this bridge: a server icon, its name, a status (`done` dot "Online", `blocked` dot "Offline" with a `dim` line under it, "Can't reach it. Is Share this computer turned on over there?", or the raw state), and **Remove**. The first click turns it into a `blocked` "Remove?" for 4 seconds; a second click removes it.
+   - With none: "None yet. Add one to use its terminals from here."
+   - **Add a computer** opens a card with three numbered steps (20px circles on `raised`): 1. "On the other computer, open Tailcat bridge and turn on Share this computer." 2. "Copy the invite code it shows, and paste it here:" with a field. 3. "Name this computer:" with a field (Enter connects). Then **Cancel** and **Connect**.
+   - While waiting: a card with an `accent` border, a spinner and "Waiting for the other computer to allow <name>…", this computer's pairing code in 22px semibold on `raised` (like `0K4-58W`), "On the other computer, click Allow next to this code." and **Cancel**.
 
-Buttons are 30px tall with radius 7. The primary one is `solid`, the others `raised` with an `input` border. While an action runs, its button reads "Working…". Results show under each section in 12px: errors in `blocked`, success in `done`.
+2. **Share this computer**, below a 1px `border` line: a switch (34×20, `solid` when on) with the title and a `muted` line: "Let your other computers use this one's terminals." / "On. Computers you allow can use this one." / "Turning on…".
+   - When on: a warning strip tinted `blocked` (`14` fill, `40` border): "Computers you allow can do anything you can do on this computer." and an `accent` **Security notes** link to SECURITY.md on GitHub.
+   - Step 1: "Copy this invite code and paste it on the computer that will connect. Keep it private, like a password.", with the `tc…` code (truncated) and **Copy**.
+   - Step 2: "When it asks to connect, check the code matches and click Allow." Each request is a card with an `accent` border: "A computer wants to connect", "Allow it only if the other computer shows this code.", the pairing code (16px semibold on `raised`), and below them **Don't allow** and **Allow** (primary). With none: "Waiting for a computer to ask. Keep this window open so you can allow it."
+   - If sharing ends without being turned off: "Sharing stopped on its own. The last thing it printed:" and its last 3 lines.
+   - **Computers allowed to connect here** (whenever any exist, sharing or not): a row per approved computer with a monitor icon, its pairing code, "allowed Nov 26", and **Remove** (two clicks, as above).
+
+A `dim` 11.5px footer: "Open this again with <key>, or "Tailcat bridge" in the command palette." (the key from `keys()`: the `cmd-` one on macOS, the other elsewhere; without one, only the palette).
+
+Buttons are 30px tall with radius 7: primary `solid`, others `raised` with an `input` border. While an action runs, its button reads "Working…" and every button is dimmed and ignores clicks. **Copy** reads "Copied" for 1.5s. Results show in 12px under each part: errors in `blocked`, success in `done`.
 
 ## How it behaves
 
-- On open it finds the platform (a home path like `C:\…` means Windows) and the architecture (`uname -sm`, or `%PROCESSOR_ARCHITECTURE%`). Then it hashes the binary at `~/.local/bin/herdr-tsbridge` or `%LocalAppData%\herdr-tsbridge\herdr-tsbridge.exe`. It uses the binary only when the SHA-256 matches the table pinned in `main.js`.
-- **Download** runs `curl -fsSL --create-dirs` from this repo's GitHub release, does `chmod 755` on Unix, then checks the hash again.
-- **Add machine** checks the address (`tc` plus base64url characters) and the name (`[a-z0-9-]{1,32}`). Then it runs `hc machine add --via '<bin> pipe <addr>' --name <name> --json`. On Windows the binary path is double-quoted, because `--via` is split with CommandLineToArgvW there. On Unix it is a single-quoted sh line.
-- **Start** checks each key against `^nodekey:[0-9a-f]{64}$` and removes a finished `tsbridge-serve` terminal. It then runs `hc run --bg --no-parent --name tsbridge-serve -- <bin> serve -allow <keys> -log <audit log>`. The server is a herdr-core terminal, so it keeps running when the window closes. The audit log goes to `%LocalAppData%\herdr-tsbridge\audit.log` or `~/.local/state/herdr-tsbridge-audit.log`.
-- Every 3 seconds it reads `hc get tsbridge-serve --json`. While the server is live and the address isn't known yet, it runs `<bin> addr`, which prints the saved address. It never parses the terminal screen, where a long address would wrap. If the server ends without **Stop**, its last 3 lines show in `blocked`.
-- **Stop** runs `hc kill tsbridge-serve`. The allowed keys persist in `localStorage`.
+- **Finding the helper.** On open it finds the platform (a home path like `C:\…` means Windows) and the architecture (`uname -sm`, or `%PROCESSOR_ARCHITECTURE%`), then hashes `~/.local/bin/herdr-tsbridge` or `%LocalAppData%\herdr-tsbridge\herdr-tsbridge.exe`. It uses the binary only when the SHA-256 matches the table pinned in `main.js`.
+- **Download** runs `curl -fsSL --create-dirs` from this repo's GitHub release into `<bin>.download`, checks the hash, and only then does `chmod 755` and moves it over `<bin>` (`move /y` on Windows). A mismatch deletes the temp file, so an unverified binary never lands on PATH. On Windows the move fails while the old `.exe` is running (serve or a pipe); the temp file is deleted and the error says to stop those first.
+- **Connect** checks the invite code (`tc` plus base64url characters), the name (lowercased, `[a-z0-9-]{1,32}`) and that the name isn't already listed. It shows `<bin> code`, then runs `<bin> wait <invite>`, which pings the server about once a second, for up to 5 minutes, until it's admitted. Then it runs `hc machine add --via '<bin> pipe <invite>' --name <name> --json`. On Windows the binary path is double-quoted, because `--via` is split with CommandLineToArgvW there. On Unix it is a single-quoted sh line. A timeout shows "The other computer didn't allow it in time…". Cancel stops listening; the `wait` process runs out its time.
+- **Your computers** is `hc machine ls --json`, keeping non-temporary machines whose `target` contains `herdr-tsbridge` and ` pipe `. **Remove** runs `hc machine rm <name>`.
+- **Turning sharing on** first moves keys typed into the old dialog (`localStorage` "allow") into the approved list with `<bin> allow`. It removes a finished `tsbridge-serve` terminal, then runs `hc run --bg --no-parent --name tsbridge-serve -- <bin> serve -log <audit log>`. The server is a herdr-core terminal, so it keeps running when the window closes. The audit log goes to `%LocalAppData%\herdr-tsbridge\audit.log` or `~/.local/state/herdr-tsbridge-audit.log`. Turning it off runs `hc kill tsbridge-serve`.
+- **Requests.** An unapproved computer that pings becomes a request in `<bin> clients` (JSON: `pending` and `allow`, each `{key, code, since}`). **Allow** runs `<bin> allow <key>`, **Don't allow** `<bin> deny <key>`, and **Remove** under allowed computers `<bin> revoke <key>`. The running serve applies each within a second; revoking also closes that computer's sessions.
+- Every 2 seconds (skipped while the last refresh is still running) it reads `hc get tsbridge-serve --json`, `hc machine ls --json` and `<bin> clients`. While the server is live and the invite isn't known yet, it runs `<bin> addr`, which prints the saved address. It never parses the terminal screen, where a long address would wrap.
 
 ## Built from
 
-One mod, `mods/tsbridge/`: `main.js` and `mod.json` (`{ "place": "none", "title": "Tailcat bridge", "overlay": { "kind": "dialog", "width": 600, "height": 520 } }`). Open it with `mod.open {name: "tsbridge"}` (`herdr-app do mod.open --name tsbridge`).
+One mod, `mods/tsbridge/`: `main.js` and `mod.json` (`place: "none"`, title "Tailcat bridge", a 600×560 dialog overlay, and a `palette` entry that runs `mod.open {name: "tsbridge"}`). A `keys.json` at the repo root binds `cmd-alt-t` (macOS) and `ctrl-shift-y` (Windows/Linux; ctrl-alt is AltGr there) to `mod.open:tsbridge`; merge it into the person's. The footer shows the `cmd-` key on macOS and the other one elsewhere. It also opens with `herdr-app do mod.open --name tsbridge`.
 
-It uses `div`, `h_flex`, `v_flex`, `InputState`/`Input` and `cx.write_to_clipboard`. From `herdr` it uses `exec`, `hc`, `home`, `theme` and `checking`.
+It uses `div`, `svg`, `h_flex`, `v_flex`, `InputState`/`Input`, `cx.write_to_clipboard`, `cx.open_url` and `cx.timer`, and the shipped `mods/workspace-chrome/{spinner,server}.svg` icons. From `herdr` it uses `exec`, `hc`, `home`, `theme`, `checking`, `keys`, `props` and `closeOverlay`.
 
-**Programs it runs:** `herdr-tsbridge` (`key`, `addr`, `serve`), `hc`, `curl`, `uname`/`cmd`, `sha256sum`/`shasum`/`certutil`, `chmod`, `mkdir`.
+**Programs it runs:** `herdr-tsbridge` (`code`, `wait`, `clients`, `allow`, `deny`, `revoke`, `addr`, `serve`), `hc`, `curl`, `uname`/`cmd`, `sha256sum`/`shasum`/`certutil`, `chmod`, `mv`/`move`, `rm`/`del`, `mkdir`.
 
 **Network:** the one-time download from `github.com/dhruvsaxena1998/herdr-tsbridge/releases`. After that, the binary itself reaches Tailscale's DERP relays and `tailcat.dev` (first serve only).
 
-**Files outside its folder:** it writes the binary path and the audit log above. The binary keeps its secrets in the macOS Keychain, or encrypted with DPAPI under `%LocalAppData%` (see SECURITY.md).
+**Files outside its folder:** it writes the binary path and the audit log above. The binary keeps the approved and pending lists (`<profile>-clients.json`, `<profile>-pending.json`, public keys only) next to its secrets. The binary keeps its secrets in the macOS Keychain, or encrypted with DPAPI under `%LocalAppData%` (see SECURITY.md).
 
 The Go source for the binary is at the root of this repo. Build it with `CGO_ENABLED=0 go build -trimpath -ldflags '-s -w'` per GOOS/GOARCH. Publishing a new release means updating `VERSION` and `SHA256` in `main.js`.
 
@@ -44,15 +57,20 @@ The Go source for the binary is at the root of this repo. Build it with `CGO_ENA
 
 - `window()` is null during `herdr-app check`, so platform detection uses `home()`.
 - `.child(null)` throws, so an empty note is an empty `div()`.
-- `herdr-app check` draws only the "Checking…" state. Its `init` skips every `exec` while `checking()`.
+- `herdr-app check` draws only the "Checking…" state, so try the add, waiting and sharing states in the app too. Its `init` skips every `exec` while `checking()`.
+- `toLocaleDateString` options are ignored in Herdr's JS, so the "allowed" date is formatted by hand.
 - `hc machine add` refuses a machine that is this same core ("is this core"), so a loopback test proves the tunnel but can't add it.
-- Serving gives allowlisted keys a full `herdr-core connect` as the current user. Changing the keys needs Stop, then Start.
-- Builds exist for darwin, windows and linux, amd64 and arm64. Linux keeps secrets in 0600 files.
+- Approving gives that computer a full `herdr-core connect` as the current user. Requests are decided before the WireGuard handshake, so the pairing-code check is what tells a person it's their own computer; the invite's pre-shared key is what keeps strangers out.
+- The sharing computer sees only a pairing code for each client, not its name.
+- Builds exist for darwin, windows and linux, amd64 and arm64, and are reproducible. Linux keeps secrets in 0600 files.
 
 ## Done when
 
 - `herdr-app check mods/tsbridge` passes.
-- On a fresh machine, **Download** fetches the binary and the dialog shows this machine's `nodekey:`.
-- On the serving machine, **Start** with the client's key shows "Serving" and a `tc…` address.
-- On the client, pasting that address and a name, then **Add machine**, lists the machine in `hc machine ls`, and `hc exec --on <name> hostname` prints the server's hostname.
-- **Stop** ends serve, and the client can no longer reach it.
+- On a fresh machine, **Download** fetches the helper and the page shows **Your computers** and **Share this computer**.
+- `cmd-alt-t` (macOS) / `ctrl-shift-y` (Windows) and the palette's **Tailcat bridge** open it; Escape closes it.
+- On the sharing computer, turning on **Share this computer** shows a `tc…` invite code.
+- On the other computer, pasting it with a name and clicking **Connect** shows a pairing code, and the same code appears as a request on the sharing computer.
+- **Allow** there makes the other computer list it under **Your computers** and in `hc machine ls`, and `hc exec --on <name> hostname` prints the sharing computer's hostname.
+- **Remove** under **Computers allowed to connect here** disconnects it within seconds, and it shows Offline on the other computer.
+- Turning sharing off ends serve, and the other computer can no longer reach it.

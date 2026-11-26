@@ -20,10 +20,11 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
+	"syscall"
 	"time"
 
 	"github.com/tailscale/tailcat"
@@ -39,13 +40,18 @@ const (
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
 	if len(os.Args) < 2 {
-		usage()
+		usage(2)
+	}
+	switch os.Args[1] {
+	case "-h", "-help", "--help", "help":
+		usage(0)
 	}
 	fs := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
 	allow := fs.String("allow", "", "comma-separated client nodekeys allowed to connect (serve)")
 	herdr := fs.String("herdr", "herdr-core", "herdr-core binary to run (serve)")
 	logFile := fs.String("log", "", "append the audit log to this file as well as stderr (serve)")
 	maxConns := fs.Int("max-conns", 16, "most connections served at once (serve)")
+	timeout := fs.Duration("timeout", 5*time.Minute, "how long to wait for approval (wait)")
 	fs.Parse(os.Args[2:])
 
 	// HERDR_TSBRIDGE_PROFILE keeps separate identities side by side, e.g. one per client site.
@@ -66,6 +72,31 @@ func main() {
 		}
 		fmt.Println(k.Public().String())
 		return
+	case "code":
+		k, err := loadClientKey(profile + "-client")
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(pairCode(k.Public()))
+		return
+	case "wait":
+		if fs.NArg() < 1 {
+			usage(2)
+		}
+		err = wait(profile+"-client", fs.Arg(0), *timeout)
+	case "clients":
+		err = printClients(profile)
+	case "allow", "deny", "revoke":
+		if fs.NArg() < 1 {
+			usage(2)
+		}
+		var k key.NodePublic
+		var path string
+		if k, err = parseKey(fs.Arg(0)); err == nil {
+			if path, err = statePath(profile, "clients"); err == nil {
+				err = editClients(path, os.Args[1], k)
+			}
+		}
 	case "addr":
 		id, saved, err := loadIdentity(profile + "-server")
 		if err != nil {
@@ -77,45 +108,65 @@ func main() {
 		fmt.Println(id.Public.Addr())
 		return
 	case "serve":
-		err = serve(profile+"-server", *allow, *herdr, *logFile, *maxConns)
+		err = serve(profile, *allow, *herdr, *logFile, *maxConns)
 	case "pipe":
 		// shortcut: hc appends the shell line it wants run remotely; the server
 		// always runs `herdr-core connect`, so hc's --session is not passed through.
 		if fs.NArg() < 1 {
-			usage()
+			usage(2)
 		}
 		if err = pipe(profile+"-client", tailcat.Addr(fs.Arg(0))); err == nil {
 			return
 		}
 	default:
-		usage()
+		usage(2)
 	}
-	log.Fatal(err)
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 
-func usage() {
+func usage(code int) {
 	fmt.Fprintln(os.Stderr, `usage:
-  herdr-tsbridge key                                     print this machine's client nodekey
-  herdr-tsbridge addr                                    print the saved server address (secret)
-  herdr-tsbridge addr                                    print the saved server address (secret)
-  herdr-tsbridge serve -allow nodekey:...[,...] [-herdr PATH] [-log FILE] [-max-conns N]
-  herdr-tsbridge pipe ADDRESS [ignored...]               stdin/stdout to the server (hc --via)`)
-	os.Exit(2)
+client side:
+  herdr-tsbridge key                     print this machine's client nodekey
+  herdr-tsbridge code                    print its short pairing code (shown on the server when it asks)
+  herdr-tsbridge wait [-timeout 5m] ADDRESS
+                                         ask the server to connect; exit 0 once it's approved
+  herdr-tsbridge pipe ADDRESS [ignored...]
+                                         stdin/stdout to the server (hc --via)
+server side:
+  herdr-tsbridge serve [-allow nodekey:...[,...]] [-herdr PATH] [-log FILE] [-max-conns N]
+                                         serve herdr-core; unknown clients wait for approval
+  herdr-tsbridge addr                    print the saved server address (the invite; secret)
+  herdr-tsbridge clients                 JSON: clients asking to connect, and approved ones
+  herdr-tsbridge allow|deny|revoke KEY   approve, refuse, or remove a client (serve applies it live)
+
+HERDR_TSBRIDGE_PROFILE=name keeps a separate set of keys (default: "default").`)
+	os.Exit(code)
 }
 
-func serve(secretName, allowList, herdr, logFile string, maxConns int) error {
+func serve(profile, allowList, herdr, logFile string, maxConns int) error {
+	secretName := profile + "-server"
 	if logFile != "" {
 		f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-		log.SetOutput(io.MultiWriter(os.Stderr, f))
+		log.SetOutput(io.MultiWriter(f, os.Stderr)) // file first: MultiWriter stops at the first failing writer, and stderr dies with the terminal
 	}
-	if allowList == "" {
-		return errors.New("serve needs -allow nodekey:... (run `herdr-tsbridge key` on the client)")
+	clientsPath, err := statePath(profile, "clients")
+	if err != nil {
+		return err
 	}
-	var allow tailcat.KeySet
+	pendingPath, err := statePath(profile, "pending")
+	if err != nil {
+		return err
+	}
+	g := newGate(clientsPath, pendingPath)
+	allow := &g.static
+	n := 0
 	for _, s := range strings.Split(allowList, ",") {
 		if s = strings.TrimSpace(s); s == "" {
 			continue
@@ -124,7 +175,13 @@ func serve(secretName, allowList, herdr, logFile string, maxConns int) error {
 		if err := k.UnmarshalText([]byte(s)); err != nil {
 			return fmt.Errorf("-allow %q: %w", s, err)
 		}
-		allow.Add(k)
+		if !allow.Contains(k) {
+			allow.Add(k)
+			n++
+		}
+	}
+	if strings.TrimSpace(allowList) != "" && n == 0 {
+		return errors.New("-allow has no keys in it")
 	}
 	if maxConns < 1 {
 		return errors.New("-max-conns must be at least 1")
@@ -136,7 +193,7 @@ func serve(secretName, allowList, herdr, logFile string, maxConns int) error {
 		herdrPath, err = filepath.Abs(herdrPath)
 	}
 	if err != nil {
-		return fmt.Errorf("finding %s: %w", herdr, err)
+		return fmt.Errorf("finding %s: %w; install herdr-core or pass -herdr /absolute/path", herdr, err)
 	}
 
 	id, saved, err := loadIdentity(secretName)
@@ -147,8 +204,6 @@ func serve(secretName, allowList, herdr, logFile string, maxConns int) error {
 		id = *tailcat.NewPrivateKey()
 	}
 
-	var mu sync.Mutex
-	refused := map[key.NodePublic]bool{}
 	s := &tailcat.Server{
 		Key:            id.Private,
 		PresharedKey:   id.Public.PresharedKey,
@@ -158,22 +213,10 @@ func serve(secretName, allowList, herdr, logFile string, maxConns int) error {
 				log.Printf("tailcat: "+format, args...)
 			}
 		},
-		AllowClient: func(k key.NodePublic) bool {
-			if allow.Contains(k) {
-				return true
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			if !refused[k] && len(refused) <= maxRefusalLogs {
-				refused[k] = true
-				if len(refused) > maxRefusalLogs {
-					log.Printf("more than %d distinct clients refused; no longer logging refusals", maxRefusalLogs)
-				} else {
-					log.Printf("refused %s", k)
-				}
-			}
-			return false
-		},
+		AllowClient: g.admit,
+	}
+	if err := g.reload(s.DisconnectClient); err != nil {
+		return fmt.Errorf("reading %s: %w", clientsPath, err)
 	}
 	if saved {
 		s.Region = id.Public.Region[0] // pinned: restarts don't depend on fetching tailcat.dev's relay map
@@ -191,6 +234,8 @@ func serve(secretName, allowList, herdr, logFile string, maxConns int) error {
 			return
 		}
 		defer func() { <-slots }()
+		g.track(peer, c, true)
+		defer g.track(peer, c, false)
 		start := time.Now()
 		log.Printf("open %s", peer)
 		run(c)
@@ -203,6 +248,9 @@ func serve(secretName, allowList, herdr, logFile string, maxConns int) error {
 		return nil
 	}
 
+	if !saved {
+		log.Printf("starting; the first run fetches the relay map from tailcat.dev")
+	}
 	if err := s.Start(); err != nil {
 		return err
 	}
@@ -221,9 +269,89 @@ func serve(secretName, allowList, herdr, logFile string, maxConns int) error {
 			return err
 		}
 	}
-	log.Printf("serving %s connect for %d allowed client(s)", herdrPath, len(strings.Split(allowList, ",")))
+	log.Printf("serving %s connect; %d client(s) from -allow, approved ones from %s", herdrPath, n, clientsPath)
 	fmt.Println("address (secret, share only with the client machine):", addr)
-	select {}
+	defer os.Remove(pendingPath) // nobody is asking once serve is gone
+	// Return on Ctrl-C / hc kill (SIGHUP, then SIGTERM) so the deferred closes run and the log records the stop.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGHUP, syscall.SIGTERM)
+	defer stop()
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("stopping")
+			return nil
+		case <-tick.C:
+			if err := g.reload(s.DisconnectClient); err != nil {
+				log.Printf("reading %s: %v (keeping the previous list)", clientsPath, err)
+			}
+			g.flushPending()
+		}
+	}
+}
+
+// printClients prints, as JSON, who is asking to connect (while serve runs) and who is approved.
+func printClients(profile string) error {
+	var out struct {
+		Pending []clientEntry `json:"pending"`
+		Allow   []clientEntry `json:"allow"`
+	}
+	pendingPath, err := statePath(profile, "pending")
+	if err != nil {
+		return err
+	}
+	clientsPath, err := statePath(profile, "clients")
+	if err != nil {
+		return err
+	}
+	var c clientsFile
+	if err := readJSON(pendingPath, &out.Pending); err != nil {
+		return err
+	}
+	if err := readJSON(clientsPath, &c); err != nil {
+		return err
+	}
+	out.Allow = c.Allow
+	if out.Pending == nil {
+		out.Pending = []clientEntry{}
+	}
+	if out.Allow == nil {
+		out.Allow = []clientEntry{}
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(b))
+	return nil
+}
+
+// wait asks the server to admit this client until it does (a person approved
+// it there) or the timeout passes. Each ping announces us, which is what puts
+// the request on the server's screen.
+func wait(secretName, address string, timeout time.Duration) error {
+	if _, err := tailcat.ParseAddr(tailcat.Addr(address)); err != nil {
+		return fmt.Errorf("that isn't an invite address: %w", err)
+	}
+	k, err := loadClientKey(secretName)
+	if err != nil {
+		return err
+	}
+	c := &tailcat.Client{Server: tailcat.Addr(address), Key: k, Logf: func(string, ...any) {}}
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for {
+		if _, err := c.Ping(ctx); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("no approval within %s: is sharing on there, and was %s allowed?", timeout, pairCode(k.Public()))
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 // loadIdentity returns the saved server identity; a damaged one is an error, never silently replaced.
@@ -281,5 +409,46 @@ func loadClientKey(name string) (key.NodePrivate, error) {
 	if err != nil {
 		return k, err
 	}
-	return k, saveSecret(name, txt)
+	if err := saveSecret(name, txt); err != nil {
+		return k, err
+	}
+	// Read back: if another process created a key at the same moment, theirs may be the one stored.
+	// shortcut: narrows the first-run race but doesn't close it; add a lock file if two first-ever pipes ever collide in practice.
+	if b, _, err = loadSecret(name); err != nil {
+		return k, err
+	}
+	return k, k.UnmarshalText(b)
+}
+
+// writeSecretFile replaces path in one step (temp file + rename), so a crash
+// never leaves a truncated secret, and forces owner-only permissions.
+func writeSecretFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name()) // no-op once renamed
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
 }

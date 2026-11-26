@@ -1,32 +1,39 @@
-// Tailcat bridge: reach another machine's herdr-core over Tailcat instead
-// of SSH (github.com/dhruvsaxena1998/herdr-tsbridge). One dialog for both
-// sides: "Connect to a machine" adds it with `hc machine add --via`, and
-// "Let machines connect here" runs `herdr-tsbridge serve` as a herdr-core
-// terminal, so it outlives this window. Opened with `mod.open tsbridge`.
+// Tailcat bridge: use another computer's herdr-core over Tailcat instead of
+// SSH (github.com/dhruvsaxena1998/herdr-tsbridge). One page, both sides:
+// "Your computers" lists and adds machines (`hc machine add --via`), and
+// "Share this computer" runs `herdr-tsbridge serve` as a herdr-core terminal,
+// so it outlives this window. Pairing takes one string: the sharing side's
+// invite code goes to the other computer, which asks to connect; the sharing
+// side approves it by its short pairing code. Opened with
+// `mod.open {name: "tsbridge"}`, the command palette, or the key in keys.json.
 
-import { View, div } from "gpui-kit";
+import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { exec, hc, home, theme, checking } from "herdr";
+import { exec, hc, home, theme, checking, keys, props, closeOverlay } from "herdr";
 
 // Pinned release. A binary runs only after its SHA-256 matches this table.
-const VERSION = "v0.1.0";
+const VERSION = "v0.2.0";
 const SHA256 = {
-  "darwin-amd64": "91ef1255ff0f5acd222caa9ea8ad6e557a7485f4b311ef52bc17180453b18871",
-  "darwin-arm64": "e2f23f7cd143ae3d2f25fcc58dc041f82f1ecdcdd329a874127d66dc7e049a57",
-  "linux-amd64": "ef66bf6af11aa3bb0732c11d627d299b94078c7d4dbc9871d52af2a441adbfd1",
-  "linux-arm64": "61c1fef3e918d4b3046cec78a92e5c968b3d3981b875360fe650ec73dc08d146",
-  "windows-amd64": "a5739726a4f92ec9c7fcad9ba1a54c517a437d3c80f669dc26058cd405f73669",
-  "windows-arm64": "927f7bee5b157196f89cf16a828064e72eefe90873e43a12314626c18478164c",
+  "darwin-amd64": "17222fb0b9271d0f0af5da97d346a7a934d9951bfad8aed650792e8798f3c3c8",
+  "darwin-arm64": "3589ef5fe7f38effe5bbbab3a940b4876de97cd4f9c254b4094e55b120b866fe",
+  "linux-amd64": "7ff8283fda7802d0571bcba49ccf870c768f30cbe32029480f810bf4e47d8cab",
+  "linux-arm64": "31fd6d0b2ce337cb36ac9050a20d9ceec2365d86aae164a1e5ae97e4256edf2c",
+  "windows-amd64": "24c19644a3289232429c2989d7019defd0dccfafbc86bfb7dd0a83f0b3a59a02",
+  "windows-arm64": "bfd658d2b64a931bbd6ef3cdc443fd06e8dfa04fcd8cab5cede30a21947f2fca",
 };
-const URL = `https://github.com/dhruvsaxena1998/herdr-tsbridge/releases/download/${VERSION}/herdr-tsbridge-`;
+const REPO = "https://github.com/dhruvsaxena1998/herdr-tsbridge";
+const URL = `${REPO}/releases/download/${VERSION}/herdr-tsbridge-`;
 const SERVE = "tsbridge-serve"; // the herdr-core terminal running serve
+const I = (name) => `mods/workspace-chrome/${name}.svg`; // Herdr's shipped icons
 
-const KEY_RE = /^nodekey:[0-9a-f]{64}$/;
 const ADDR_RE = /^tc[A-Za-z0-9_-]+$/; // base64url: safe inside the --via line unquoted
 const NAME_RE = /^[a-z0-9-]{1,32}$/;
+const KEY_RE = /^nodekey:[0-9a-f]{64}$/;
 
 const win = () => /^[a-z]:[\\/]/i.test(home()); // window() is null during checks
-const out = (r) => (r.code === 0 ? r.stdout.trim() : Promise.reject(new Error((r.stderr || r.stdout).trim() || `exit ${r.code}`)));
+const out = (r) => (r.code === 0 ? r.stdout.trim() : Promise.reject(new Error((r.stderr || r.stdout).trim().replace(/^\d{4}\/\d\d\/\d\d \d\d:\d\d:\d\d /, "") || `exit ${r.code}`)));
+const isOurs = (m) => typeof m.target === "string" && m.target.includes("herdr-tsbridge") && m.target.includes(" pipe ");
+const day = (iso) => { const d = new Date(iso); return `${"Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(" ")[d.getMonth()]} ${d.getDate()}`; }; // toLocaleDateString ignores options here
 
 async function target() {
   if (win()) {
@@ -51,24 +58,35 @@ export default class Tsbridge extends View {
   init(_props, cx) {
     this.bin = win() ? `${home()}\\AppData\\Local\\herdr-tsbridge\\herdr-tsbridge.exe` : `${home()}/.local/bin/herdr-tsbridge`;
     this.ready = false; // binary present and verified
-    this.busy = null; // what's running now, shown on the buttons
+    this.stale = false; // a binary is there but isn't the pinned one
+    this.busy = null; // the action running now; every button waits for it
     this.msg = {}; // section -> { text, error }
-    this.key = null;
+    this.code = null; // this computer's pairing code
+    this.machines = []; // computers added through this bridge
+    this.adding = null; // null | "form" | { name, token } while waiting for approval
     this.serve = null; // { live, tail } of the serve terminal
-    this.addr = null;
-    this.addrInput = InputState.new({ placeholder: "tc… address from the other machine" });
-    this.nameInput = InputState.new({ placeholder: "name, e.g. winvm" });
-    this.allowInput = InputState.new({ placeholder: "nodekey:… (comma-separated)", value: localStorage.getItem("allow") ?? "" });
-    this.allowInput.on("change", () => localStorage.setItem("allow", this.allowInput.value()));
+    this.addr = null; // the invite code while sharing
+    this.clients = { pending: [], allow: [] };
+    this.confirm = null; // id of a Remove button waiting for its second click
+    this.handle = cx.focus_handle();
+    this.handle.focus();
+    this.addrInput = InputState.new({ placeholder: "Paste the invite code (starts with tc)" });
+    this.nameInput = InputState.new({ placeholder: "e.g. work-pc" });
+    this.nameInput.on("submit", (_e, cx) => this.connect(cx));
     if (checking()) return;
     cx.spawn(async (cx) => {
-      await this.check().catch((e) => this.say("bin", e));
+      await this.check().catch((e) => this.say("setup", e));
       cx.notify();
     });
-    cx.timer.every(3000, (cx) => {
-      if (!this.ready) return;
+    cx.timer.every(2000, (cx) => {
+      if (!this.ready || this.refreshing) return; // a slow hc call must not stack refreshes
+      this.refreshing = true;
       cx.spawn(async (cx) => {
-        await this.refreshServe();
+        try {
+          await this.refresh();
+        } finally {
+          this.refreshing = false;
+        }
         cx.notify();
       });
     });
@@ -80,25 +98,49 @@ export default class Tsbridge extends View {
 
   async check() {
     this.target = await target();
-    if (!SHA256[this.target]) throw new Error(`No ${VERSION} build for ${this.target}.`);
+    if (!SHA256[this.target]) throw new Error(`There's no ${VERSION} build for ${this.target}. You can build it from source: ${REPO}`);
     const sum = await sha256(this.bin).catch(() => null);
     this.ready = sum === SHA256[this.target];
+    this.stale = !!sum && !this.ready;
     if (!this.ready) return;
-    this.key = await exec(this.bin, ["key"]).then(out);
-    await this.refreshServe();
+    this.code = await exec(this.bin, ["code"]).then(out).catch((e) => (this.say("mine", new Error(`Couldn't read this computer's identity: ${e.message}`)), null));
+    await this.refresh();
   }
 
   async download() {
     const name = `herdr-tsbridge-${this.target}${win() ? ".exe" : ""}`;
-    await exec("curl", ["-fsSL", "--create-dirs", "-o", this.bin, URL + name], { timeout: 180000 }).then(out)
-      .catch((e) => Promise.reject(new Error(`${e.message} (${URL + name})`)));
-    if (!win()) await exec("chmod", ["755", this.bin]).then(out);
-    if ((await sha256(this.bin)) !== SHA256[this.target]) throw new Error("The download's SHA-256 doesn't match; not using it.");
+    const tmp = `${this.bin}.download`;
+    const rm = () => (win() ? exec("cmd", ["/c", "del", "/f", "/q", tmp]) : exec("rm", ["-f", tmp])).catch(() => null);
+    // Into a temp file first: only a verified binary ever takes this.bin's place.
+    await exec("curl", ["-fsSL", "--create-dirs", "-o", tmp, URL + name], { timeout: 180000 }).then(out)
+      .catch((e) => (rm(), Promise.reject(new Error(`Download failed: ${e.message} (${URL + name})`))));
+    if ((await sha256(tmp).catch(() => null)) !== SHA256[this.target]) {
+      await rm();
+      throw new Error("The download didn't match the expected checksum, so it was deleted.");
+    }
+    if (win()) {
+      // Windows can't replace an .exe that's running (sharing, or a connection to an added computer).
+      await exec("cmd", ["/c", "move", "/y", tmp, this.bin]).then(out)
+        .catch(async () => (await rm(), Promise.reject(new Error(`It's in use, so it couldn't be replaced. Turn off sharing (hc kill ${SERVE}) and close connections to your computers, then try again.`))));
+    } else {
+      await exec("chmod", ["755", tmp]).then(out);
+      await exec("mv", ["-f", tmp, this.bin]).then(out);
+    }
     await this.check();
   }
 
-  async refreshServe() {
-    const r = await hc(["get", SERVE, "--json"]).catch(() => null);
+  async refresh() {
+    const [r, ms, cl] = await Promise.all([
+      hc(["get", SERVE, "--json"]).catch(() => null),
+      hc(["machine", "ls", "--json"]).catch(() => null),
+      exec(this.bin, ["clients"]).catch(() => null),
+    ]);
+    try {
+      if (ms?.code === 0) this.machines = (JSON.parse(ms.stdout).machines ?? []).filter((m) => !m.temporary && isOurs(m));
+    } catch {}
+    try {
+      if (cl?.code === 0) this.clients = JSON.parse(cl.stdout);
+    } catch {}
     let t = null;
     try {
       t = r?.code === 0 ? JSON.parse(r.stdout) : null;
@@ -108,7 +150,8 @@ export default class Tsbridge extends View {
     if (t && !live && !this.stopped) tail = (await hc(["read", SERVE, "--lines", "6"]).then(out).catch(() => "")).split("\n").filter(Boolean).slice(-3).join("\n");
     this.serve = t ? { live, tail } : null;
     // The identity is saved a moment after serve starts; ask until it is.
-    if (live && !this.addr) this.addr = await exec(this.bin, ["addr"]).then(out).catch(() => null);
+    if (live && !this.addr && !this.stopped) this.addr = await exec(this.bin, ["addr"]).then(out).catch(() => null);
+    if (!live) this.addr = null;
   }
 
   // Runs one action, reporting into its section.
@@ -129,100 +172,234 @@ export default class Tsbridge extends View {
     });
   }
 
-  addMachine(cx) {
+  // Remove buttons take two clicks: the first turns them into "Remove?".
+  confirmed(id, cx) {
+    if (this.confirm === id) return (this.confirm = null), true;
+    this.confirm = id;
+    cx.notify();
+    cx.timer.after(4000, (cx) => { if (this.confirm === id) this.confirm = null; cx.notify(); });
+    return false;
+  }
+
+  connect(cx) {
     const addr = this.addrInput.value().trim();
-    const name = this.nameInput.value().trim();
-    if (!ADDR_RE.test(addr)) return this.say("connect", "Paste the tc… address that serve printed on the other machine."), cx.notify();
-    if (!NAME_RE.test(name)) return this.say("connect", "Name: 1-32 of a-z, 0-9, -."), cx.notify();
-    // Windows: a program and its arguments (CommandLineToArgvW); elsewhere an sh line.
-    const prog = win() ? `"${this.bin}"` : `'${this.bin.replace(/'/g, "'\\''")}'`;
-    this.act("connect", "add", async () => {
-      const r = await hc(["machine", "add", "--via", `${prog} pipe ${addr}`, "--name", name, "--json"]);
-      if (r.code !== 0) {
-        let m = (r.stderr || r.stdout).trim();
-        try {
-          m = JSON.parse(r.stdout || r.stderr).error?.message ?? m;
-        } catch {}
-        throw new Error(m || "hc machine add failed");
+    const name = this.nameInput.value().trim().toLowerCase();
+    if (!ADDR_RE.test(addr)) return this.say("mine", "That doesn't look like an invite code. Copy it from Share this computer on the other computer; it starts with tc."), cx.notify();
+    if (!NAME_RE.test(name)) return this.say("mine", "Give it a short name using letters, numbers or dashes, like work-pc."), cx.notify();
+    if (this.machines.some((m) => m.name === name)) return this.say("mine", `You already have a computer called ${name}. Pick another name.`), cx.notify();
+    const token = {};
+    this.adding = { name, token };
+    this.say("mine", null);
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        // Keeps asking until the other computer clicks Allow (or 5 minutes pass).
+        // shortcut: Cancel only stops listening; the wait process runs out its 5 minutes. Kill it if that ever matters.
+        await exec(this.bin, ["wait", addr], { timeout: 330000 }).then(out);
+        if (this.adding?.token !== token) return; // cancelled
+        // Windows: a program and its arguments (CommandLineToArgvW); elsewhere an sh line.
+        const prog = win() ? `"${this.bin}"` : `'${this.bin.replace(/'/g, "'\\''")}'`;
+        const r = await hc(["machine", "add", "--via", `${prog} pipe ${addr}`, "--name", name, "--json"]);
+        if (r.code !== 0) {
+          let m = (r.stderr || r.stdout).trim();
+          try {
+            m = JSON.parse(r.stdout || r.stderr).error?.message ?? m;
+          } catch {}
+          throw new Error(m || "Adding it to Herdr failed.");
+        }
+        this.addrInput.set_value("");
+        this.nameInput.set_value("");
+        this.adding = null;
+        await this.refresh();
+        this.say("mine", `${name} is added. Its terminals are in Herdr's sidebar.`, true);
+      } catch (e) {
+        if (this.adding?.token !== token) return;
+        this.adding = "form";
+        this.say("mine", e.message.startsWith("no approval") ? "The other computer didn't allow it in time. Check sharing is on there, then try again." : e);
       }
-      this.addrInput.set_value("");
-      return `Added ${name}. Its spaces and terminals are in Herdr now.`;
+      cx.notify();
+    });
+  }
+
+  removeMachine(name, cx) {
+    if (!this.confirmed(`m-${name}`, cx)) return;
+    this.act("mine", "rm", async () => {
+      await hc(["machine", "rm", name]).then(out);
+      await this.refresh();
+      return `Removed ${name}. To stop it accepting this computer too, remove this computer on that side.`;
     }, cx);
   }
 
-  startServe(cx) {
-    const keys = this.allowInput.value().split(",").map((s) => s.trim()).filter(Boolean);
-    const bad = keys.find((k) => !KEY_RE.test(k));
-    if (!keys.length || bad) return this.say("serve", bad ? `Not a key: ${bad}` : "Add at least one client key."), cx.notify();
-    const log = win() ? `${home()}\\AppData\\Local\\herdr-tsbridge\\audit.log` : `${home()}/.local/state/herdr-tsbridge-audit.log`;
-    this.act("serve", "start", async () => {
-      await hc(["rm", SERVE]).catch(() => null); // a finished one keeps the name
-      if (!win()) await exec("mkdir", ["-p", `${home()}/.local/state`]).then(out);
-      await hc(["run", "--bg", "--no-parent", "--name", SERVE, "--", this.bin, "serve", "-allow", keys.join(","), "-log", log]).then(out);
-      this.addr = null;
-      this.stopped = false;
-      await this.refreshServe();
+  setSharing(on, cx) {
+    if (on) {
+      const log = win() ? `${home()}\\AppData\\Local\\herdr-tsbridge\\audit.log` : `${home()}/.local/state/herdr-tsbridge-audit.log`;
+      this.act("share", "share", async () => {
+        // Keys typed into the old dialog become approved computers.
+        const old = (localStorage.getItem("allow") ?? "").split(",").map((s) => s.trim()).filter((k) => KEY_RE.test(k));
+        for (const k of old) await exec(this.bin, ["allow", k]).then(out);
+        localStorage.removeItem("allow");
+        await hc(["rm", SERVE]).catch(() => null); // a finished one keeps the name
+        if (!win()) await exec("mkdir", ["-p", `${home()}/.local/state`]).then(out);
+        await hc(["run", "--bg", "--no-parent", "--name", SERVE, "--", this.bin, "serve", "-log", log]).then(out);
+        this.addr = null;
+        this.stopped = false;
+        await this.refresh();
+      }, cx);
+    } else {
+      this.act("share", "share", async () => {
+        this.stopped = true; // its exit isn't an error to show
+        this.addr = null;
+        await hc(["kill", SERVE]).then(out);
+        await this.refresh();
+      }, cx);
+    }
+  }
+
+  client(op, entry, cx) {
+    if (op === "revoke" && !this.confirmed(`c-${entry.key}`, cx)) return;
+    this.act("share", `${op}-${entry.key}`, async () => {
+      await exec(this.bin, [op, entry.key]).then(out);
+      await this.refresh();
+      return { allow: `Allowed ${entry.code}. It's connecting now.`, deny: `Didn't allow ${entry.code}.`, revoke: `Removed ${entry.code}. It's disconnected and can't connect again unless you allow it.` }[op];
     }, cx);
   }
 
-  stopServe(cx) {
-    this.act("serve", "stop", async () => {
-      await hc(["kill", SERVE]).then(out);
-      this.stopped = true; // its exit isn't an error to show
-      this.addr = null;
-      await this.refreshServe();
-    }, cx);
+  copy(id, text, cx) {
+    cx.write_to_clipboard(text);
+    this.copied = id;
+    cx.notify();
+    cx.timer.after(1500, (cx) => { if (this.copied === id) this.copied = null; cx.notify(); });
   }
 
   render(cx) {
     const t = theme();
-    const button = (id, label, primary, onClick) =>
-      h_flex().id(id).h(30).px(12).items_center().rounded(7).text_size(12).cursor_pointer()
-        .bg(primary ? t.solid : t.raised).text_color(primary ? t.solid_foreground : t.foreground)
+    const button = (id, label, kind, onClick) => {
+      const primary = kind === "primary";
+      return h_flex().id(id).h(30).px(12).flex_none().items_center().justify_center().rounded(7).text_size(12)
+        .bg(primary ? t.solid : t.raised).text_color(primary ? t.solid_foreground : kind === "danger" ? t.blocked : t.foreground)
         .border_1().border_color(primary ? t.solid : t.input)
-        .when(this.busy === id, (el) => el.opacity(0.6))
-        .hover((s) => s.opacity(0.88))
-        .on_click((_e, cx) => onClick(cx))
+        .when(!!this.busy, (el) => el.opacity(0.5))
+        .when(!this.busy, (el) => el.cursor_pointer().hover((s) => s.opacity(0.88)).on_click((_e, cx) => onClick(cx)))
         .child(this.busy === id ? "Working…" : label);
-    const copy = (id, text) =>
-      button(id, this.copied === id ? "Copied" : "Copy", false, (cx) => { cx.write_to_clipboard(text); this.copied = id; cx.notify(); });
+    };
+    const copyBtn = (id, text) => button(id, this.copied === id ? "Copied" : "Copy", null, (cx) => this.copy(id, text, cx));
     const field = (state) => h_flex().items_center().flex_1().min_w(0).h(30).px(8).rounded(7).border_1().border_color(t.input).bg(t.background).child(Input.new(state));
-    const mono = (text) => div().flex_1().min_w(0).truncate().px(8).py(6).rounded(7).bg(t.background).border_1().border_color(t.border).text_size(12).text_color(t.foreground).child(text);
-    const note = (s) => (this.msg[s] ? div().text_size(12).text_color(this.msg[s].error ? t.blocked : t.done).child(this.msg[s].text) : div());
-    const heading = (text, detail) => v_flex().gap(2).child(div().text_size(13.5).font_semibold().text_color(t.foreground).child(text)).child(div().text_size(12).text_color(t.muted).child(detail));
-    const section = (id) => v_flex().id(id).gap(8).pt(12).border_t_1().border_color(t.border);
+    const mono = (text) => div().flex_1().min_w(0).truncate().px(8).py(6).rounded(7).bg(t.background).border_1().border_color(t.border).text_size(12).child(text);
+    const note = (s) => (this.msg[s] ? div().text_size(12).line_height("18px").text_color(this.msg[s].error ? t.blocked : t.done).child(this.msg[s].text) : div());
+    const muted = (text) => div().text_size(12).line_height("18px").text_color(t.muted).child(text);
+    const spin = (text) => h_flex().gap(6).items_center().text_size(12).text_color(t.muted).child(svg(I("spinner")).size(12).text_color(t.working).spin(900)).child(text);
+    const dot = (c) => div().flex_none().size(7).rounded(4).bg(c);
+    const heading = (text, right) => h_flex().items_center().pt(4).child(div().flex_1().text_size(13.5).font_semibold().child(text)).child(right ?? div());
+    const row = (icon, title, status, statusColor, action) => h_flex().gap(8).items_center().px(10).py(6).rounded(7).bg(t.background).border_1().border_color(t.border)
+      .child(svg(I(icon)).size(14).text_color(t.muted))
+      .child(div().flex_1().min_w(0).truncate().text_size(13).child(title))
+      .child(h_flex().gap(5).items_center().text_size(11.5).text_color(statusColor ?? t.muted).when(!!statusColor, (el) => el.child(dot(statusColor))).child(status))
+      .child(action);
+    const step = (n, text, body) => h_flex().gap(10).items_start()
+      .child(div().flex_none().size(20).rounded(10).bg(t.raised).border_1().border_color(t.border).text_size(11).font_semibold().text_color(t.muted).flex().items_center().justify_center().child(String(n)))
+      .child(v_flex().flex_1().min_w(0).gap(6).child(div().text_size(12.5).line_height("18px").child(text)).child(body ?? div()));
+    const close = () => closeOverlay(props()?.overlay);
 
-    const root = v_flex().id("tsbridge").size_full().min_h(0).p(18).gap(12).bg(t.popover).text_size(13).overflow_y_scrollbar()
-      .child(heading("Tailcat bridge", "Reach herdr-core on another machine over Tailcat, without SSH or a Tailscale account."));
+    const bound = keys().filter((k) => k.action === "mod.open:tsbridge").map((k) => k.keys);
+    // keys.json ships cmd-alt-t (macOS) and ctrl-shift-y (Windows/Linux); show the one that works here.
+    const shortcut = (win() ? bound.filter((k) => !k.startsWith("cmd-")) : [...bound.filter((k) => k.startsWith("cmd-")), ...bound])[0];
+    let root = v_flex().id("tsbridge").track_focus(this.handle)
+      .on_key_down((e, cx) => { if (e.key === "escape") { close(); cx.stop_propagation(); } })
+      .size_full().min_h(0).p(18).gap(10).bg(t.popover).text_color(t.foreground).text_size(13).overflow_y_scrollbar()
+      .child(h_flex().items_center()
+        .child(div().flex_1().text_size(15).font_semibold().child("Tailcat bridge"))
+        .child(div().id("ts-esc").px(6).py(2).rounded(5).text_size(11).text_color(t.dim).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click(close).child("Esc")))
+      .child(muted("Use your other computers' terminals right here. No SSH or VPN needed."));
+    const footer = div().pt(6).text_size(11.5).text_color(t.dim)
+      .child(shortcut ? `Open this again with ${shortcut}, or "Tailcat bridge" in the command palette.` : `Open this again from the command palette: "Tailcat bridge".`);
 
     if (!this.ready) {
       return root.child(
-        section("bin")
-          .child(div().text_color(t.muted).child(`Needs herdr-tsbridge ${VERSION} from GitHub, checked against a pinned SHA-256, saved to ${this.bin}.`))
-          .child(h_flex().child(this.target ? button("download", "Download", true, (cx) => this.act("bin", "download", () => this.download(), cx)) : div().text_color(t.dim).child("Checking…")))
-          .child(note("bin")),
-      );
+        v_flex().gap(10).p(14).rounded(9).bg(t.background).border_1().border_color(t.border)
+          .child(div().text_size(13).font_semibold().child(this.stale ? "An update is needed" : "One-time setup"))
+          .child(muted(this.stale
+            ? `This version of Tailcat bridge needs herdr-tsbridge ${VERSION}. Update replaces the one at ${this.bin}.`
+            : `Tailcat bridge needs a small helper program, herdr-tsbridge ${VERSION}. It's downloaded from GitHub, checked against a known checksum, and saved to ${this.bin}.`))
+          .child(this.busy === "download" ? spin("Downloading… this can take a minute on a slow connection.")
+            : h_flex().child(this.target ? button("download", this.stale ? "Update" : "Download", "primary", (cx) => this.act("setup", "download", () => this.download(), cx)) : spin("Checking…")))
+          .child(note("setup")),
+      ).child(footer);
     }
 
+    // Your computers: the ones this computer can use.
+    root = root.child(heading("Your computers", this.adding ? null : button("add-open", "Add a computer", "primary", (cx) => { this.adding = "form"; this.say("mine", null); cx.notify(); })));
+    if (this.machines.length) {
+      root = root.child(v_flex().gap(4).children(this.machines.map((m) => {
+        const [label, color] = m.state === "unreachable" ? ["Offline", t.blocked] : m.state === "connected" ? ["Online", t.done] : [m.state ?? "Unknown", null];
+        const id = `m-${m.name}`;
+        return v_flex().gap(2)
+          .child(row("server", m.name, label, color, button(id, this.confirm === id ? "Remove?" : "Remove", this.confirm === id ? "danger" : null, (cx) => this.removeMachine(m.name, cx))))
+          .when(m.state === "unreachable", (el) => el.child(div().pl(32).text_size(11.5).text_color(t.dim).child("Can't reach it. Is Share this computer turned on over there?")));
+      })));
+    } else if (!this.adding) {
+      root = root.child(muted("None yet. Add one to use its terminals from here."));
+    }
+
+    if (this.adding === "form") {
+      root = root.child(v_flex().gap(10).p(12).rounded(9).bg(t.background).border_1().border_color(t.border)
+        .child(step(1, "On the other computer, open Tailcat bridge and turn on Share this computer."))
+        .child(step(2, "Copy the invite code it shows, and paste it here:", field(this.addrInput)))
+        .child(step(3, "Name this computer:", field(this.nameInput)))
+        .child(h_flex().gap(8).justify_end()
+          .child(button("add-cancel", "Cancel", null, (cx) => { this.adding = null; this.say("mine", null); cx.notify(); }))
+          .child(button("add-go", "Connect", "primary", (cx) => this.connect(cx)))));
+    } else if (this.adding) {
+      root = root.child(v_flex().gap(10).p(14).rounded(9).bg(t.background).border_1().border_color(t.accent).items_center()
+        .child(spin(`Waiting for the other computer to allow ${this.adding.name}…`))
+        .child(div().px(16).py(8).rounded(8).bg(t.raised).border_1().border_color(t.border).text_size(22).font_semibold().child(this.code ?? "…"))
+        .child(muted("On the other computer, click Allow next to this code."))
+        .child(button("wait-cancel", "Cancel", null, (cx) => { this.adding = "form"; cx.notify(); })));
+    }
+    root = root.child(note("mine"));
+
+    // Share this computer: let others use this one.
     const s = this.serve;
-    return root
-      .child(
-        section("connect")
-          .child(heading("Connect to a machine", "Give the other machine this key, then paste the address it prints."))
-          .child(h_flex().gap(8).child(mono(this.key ?? "…")).child(copy("copy-key", this.key ?? "")))
-          .child(h_flex().gap(8).child(field(this.addrInput)))
-          .child(h_flex().gap(8).child(field(this.nameInput)).child(button("add", "Add machine", true, (cx) => this.addMachine(cx))))
-          .child(note("connect")),
-      )
-      .child(
-        section("serve")
-          .child(heading("Let machines connect here", "Every allowed key gets full control of this machine as you. Read SECURITY.md first; prefer a non-admin account."))
-          .child(h_flex().gap(8).child(field(this.allowInput)).child(
-            s?.live ? button("stop", "Stop", false, (cx) => this.stopServe(cx)) : button("start", "Start", true, (cx) => this.startServe(cx))))
-          .child(div().text_size(12).text_color(s?.live ? t.working : t.dim).child(s?.live ? `Serving (herdr-core terminal ${SERVE}). Changing keys needs Stop, then Start.` : "Not serving."))
-          .when(!!(s?.live && this.addr), (el) => el.child(h_flex().gap(8).child(mono(this.addr ?? "")).child(copy("copy-addr", this.addr ?? ""))).child(div().text_size(12).text_color(t.dim).child("The address is secret: share it only with the connecting machine.")))
-          .when(!!s?.tail, (el) => el.child(div().text_size(12).text_color(t.blocked).child(`Serve stopped: ${s.tail}`)))
-          .child(note("serve")),
-      );
+    const live = !!s?.live;
+    const switching = this.busy === "share";
+    root = root.child(h_flex().id("share-toggle").gap(10).items_center().mt(6).pt(12).border_t_1().border_color(t.border)
+      .when(!this.busy, (el) => el.cursor_pointer().on_click((_e, cx) => this.setSharing(!live, cx)))
+      .child(div().flex_none().w(34).h(20).rounded(10).p(2).bg(live ? t.solid : t.raised).border_1().border_color(t.border).when(switching, (el) => el.opacity(0.5))
+        .child(div().size(14).rounded(7).bg(live ? t.solid_foreground : t.muted).when(live, (el) => el.ml(14))))
+      .child(v_flex().flex_1()
+        .child(div().text_size(13.5).font_semibold().child("Share this computer"))
+        .child(muted(switching ? (live ? "Turning off…" : "Turning on…") : live ? "On. Computers you allow can use this one." : "Let your other computers use this one's terminals."))));
+
+    if (live) {
+      const pending = this.clients.pending ?? [];
+      root = root
+        .child(h_flex().gap(4).flex_wrap().px(10).py(8).rounded(8).bg(t.blocked + "14").border_1().border_color(t.blocked + "40").text_size(12).text_color(t.muted)
+          .child("Computers you allow can do anything you can do on this computer.")
+          .child(div().id("ts-sec").text_color(t.accent).cursor_pointer().hover((st) => st.underline()).on_click((_e, cx) => cx.open_url(`${REPO}/blob/main/SECURITY.md`)).child("Security notes")))
+        .child(step(1, "Copy this invite code and paste it on the computer that will connect. Keep it private, like a password.",
+          this.addr ? h_flex().gap(8).child(mono(this.addr)).child(copyBtn("copy-addr", this.addr)) : spin("Getting the invite code…")))
+        .child(step(2, "When it asks to connect, check the code matches and click Allow.",
+          pending.length
+            ? v_flex().gap(6).children(pending.map((p) => v_flex().gap(8).px(12).py(10).rounded(8).bg(t.background).border_1().border_color(t.accent)
+                .child(h_flex().gap(10).items_center()
+                  .child(v_flex().flex_1().min_w(0).gap(2).child(div().text_size(12.5).child("A computer wants to connect")).child(muted("Allow it only if the other computer shows this code.")))
+                  .child(div().flex_none().px(10).py(4).rounded(6).bg(t.raised).text_size(16).font_semibold().child(p.code)))
+                .child(h_flex().gap(8).justify_end()
+                  .child(button(`deny-${p.key}`, "Don't allow", null, (cx) => this.client("deny", p, cx)))
+                  .child(button(`allow-${p.key}`, "Allow", "primary", (cx) => this.client("allow", p, cx))))))
+            : muted("Waiting for a computer to ask. Keep this window open so you can allow it.")));
+    } else if (s?.tail) {
+      root = root.child(v_flex().gap(4).child(div().text_size(12).text_color(t.blocked).child("Sharing stopped on its own. The last thing it printed:")).child(mono(s.tail)));
+    }
+
+    const allowed = this.clients.allow ?? [];
+    if (allowed.length) {
+      root = root.child(div().pt(4).text_size(11.5).font_medium().text_color(t.dim).child("Computers allowed to connect here"))
+        .child(v_flex().gap(4).children(allowed.map((c) => {
+          const id = `revoke-${c.key}`;
+          return row("monitor", c.code, `allowed ${day(c.since)}`, null,
+            button(id, this.confirm === `c-${c.key}` ? "Remove?" : "Remove", this.confirm === `c-${c.key}` ? "danger" : null, (cx) => this.client("revoke", c, cx)));
+        })));
+    }
+    return root.child(note("share")).child(footer);
   }
 }
