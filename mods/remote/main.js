@@ -1,29 +1,29 @@
-// Tailcat bridge: use another computer's herdr-core over Tailcat instead of
-// SSH (github.com/dhruvsaxena1998/herdr-tsbridge). One page, both sides:
+// Herdr Remote: use another computer's herdr-core over Tailcat instead of
+// SSH (github.com/dhruvsaxena1998/herdr-remote). One page, both sides:
 // "Your computers" lists and adds machines (`hc machine add --via`), and
-// "Share this computer" runs `herdr-tsbridge serve` as a herdr-core terminal,
+// "Share this computer" runs `herdr-remote serve` as a herdr-core terminal,
 // so it outlives this window. Pairing takes one string: the sharing side's
 // invite code goes to the other computer, which asks to connect; the sharing
 // side approves it by its short pairing code. Opened with
-// `mod.open {name: "tsbridge"}`, the command palette, or the key in keys.json.
+// `mod.open {name: "remote"}`, the command palette, or the key in keys.json.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { exec, hc, home, theme, checking, keys, props, closeOverlay } from "herdr";
 
 // Pinned release. A binary runs only after its SHA-256 matches this table.
-const VERSION = "v0.2.0";
+const VERSION = "v0.3.0";
 const SHA256 = {
-  "darwin-amd64": "17222fb0b9271d0f0af5da97d346a7a934d9951bfad8aed650792e8798f3c3c8",
-  "darwin-arm64": "3589ef5fe7f38effe5bbbab3a940b4876de97cd4f9c254b4094e55b120b866fe",
-  "linux-amd64": "7ff8283fda7802d0571bcba49ccf870c768f30cbe32029480f810bf4e47d8cab",
-  "linux-arm64": "31fd6d0b2ce337cb36ac9050a20d9ceec2365d86aae164a1e5ae97e4256edf2c",
-  "windows-amd64": "24c19644a3289232429c2989d7019defd0dccfafbc86bfb7dd0a83f0b3a59a02",
-  "windows-arm64": "bfd658d2b64a931bbd6ef3cdc443fd06e8dfa04fcd8cab5cede30a21947f2fca",
+  "darwin-amd64": "c0b1d52f790ea9e17d5ab71f23b4aff72dad5d1b6724a3b7f7dd969c4a4d4b7d",
+  "darwin-arm64": "a3db2876a702ec4b2429a620f6437b3efeb4d8291a39c87c90fa92c090aa41cb",
+  "linux-amd64": "439743e0b1b303e66ba91782fc26b3047a21470b83cba1744498687029651c8b",
+  "linux-arm64": "c86aededdcf6f08533e77e2a059812fecfc11cefdd52feff3f90e24017d6fe97",
+  "windows-amd64": "3ed6ff3d36723f38d4a5542c5dc86a0594739ade6c316548e86c86a7d891bfe6",
+  "windows-arm64": "525e12e43e60fca677291ae85fdfee3a54b1b181d946e9ea31a1d678c226080b",
 };
-const REPO = "https://github.com/dhruvsaxena1998/herdr-tsbridge";
-const URL = `${REPO}/releases/download/${VERSION}/herdr-tsbridge-`;
-const SERVE = "tsbridge-serve"; // the herdr-core terminal running serve
+const REPO = "https://github.com/dhruvsaxena1998/herdr-remote";
+const URL = `${REPO}/releases/download/${VERSION}/herdr-remote-`;
+const SERVE = "remote-serve"; // the herdr-core terminal running serve
 const I = (name) => `mods/workspace-chrome/${name}.svg`; // Herdr's shipped icons
 
 const ADDR_RE = /^tc[A-Za-z0-9_-]+$/; // base64url: safe inside the --via line unquoted
@@ -32,7 +32,7 @@ const KEY_RE = /^nodekey:[0-9a-f]{64}$/;
 
 const win = () => /^[a-z]:[\\/]/i.test(home()); // window() is null during checks
 const out = (r) => (r.code === 0 ? r.stdout.trim() : Promise.reject(new Error((r.stderr || r.stdout).trim().replace(/^\d{4}\/\d\d\/\d\d \d\d:\d\d:\d\d /, "") || `exit ${r.code}`)));
-const isOurs = (m) => typeof m.target === "string" && m.target.includes("herdr-tsbridge") && m.target.includes(" pipe ");
+const isOurs = (m) => typeof m.target === "string" && m.target.includes("herdr-remote") && m.target.includes(" pipe ");
 const day = (iso) => { const d = new Date(iso); return `${"Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(" ")[d.getMonth()]} ${d.getDate()}`; }; // toLocaleDateString ignores options here
 
 async function target() {
@@ -54,9 +54,9 @@ async function sha256(path) {
   return s.split(/\s/)[0];
 }
 
-export default class Tsbridge extends View {
+export default class Remote extends View {
   init(_props, cx) {
-    this.bin = win() ? `${home()}\\AppData\\Local\\herdr-tsbridge\\herdr-tsbridge.exe` : `${home()}/.local/bin/herdr-tsbridge`;
+    this.bin = win() ? `${home()}\\AppData\\Local\\herdr-remote\\herdr-remote.exe` : `${home()}/.local/bin/herdr-remote`;
     this.ready = false; // binary present and verified
     this.stale = false; // a binary is there but isn't the pinned one
     this.busy = null; // the action running now; every button waits for it
@@ -75,6 +75,9 @@ export default class Tsbridge extends View {
     this.nameInput.on("submit", (_e, cx) => this.connect(cx));
     if (checking()) return;
     cx.spawn(async (cx) => {
+      // Sharing started before the rename runs as tsbridge-serve, which this page can't see or turn off.
+      await hc(["kill", "tsbridge-serve"]).catch(() => null);
+      await hc(["rm", "tsbridge-serve"]).catch(() => null);
       await this.check().catch((e) => this.say("setup", e));
       cx.notify();
     });
@@ -108,7 +111,7 @@ export default class Tsbridge extends View {
   }
 
   async download() {
-    const name = `herdr-tsbridge-${this.target}${win() ? ".exe" : ""}`;
+    const name = `herdr-remote-${this.target}${win() ? ".exe" : ""}`;
     const tmp = `${this.bin}.download`;
     const rm = () => (win() ? exec("cmd", ["/c", "del", "/f", "/q", tmp]) : exec("rm", ["-f", tmp])).catch(() => null);
     // Into a temp file first: only a verified binary ever takes this.bin's place.
@@ -232,7 +235,7 @@ export default class Tsbridge extends View {
 
   setSharing(on, cx) {
     if (on) {
-      const log = win() ? `${home()}\\AppData\\Local\\herdr-tsbridge\\audit.log` : `${home()}/.local/state/herdr-tsbridge-audit.log`;
+      const log = win() ? `${home()}\\AppData\\Local\\herdr-remote\\audit.log` : `${home()}/.local/state/herdr-remote-audit.log`;
       this.act("share", "share", async () => {
         // Keys typed into the old dialog become approved computers.
         const old = (localStorage.getItem("allow") ?? "").split(",").map((s) => s.trim()).filter((k) => KEY_RE.test(k));
@@ -300,26 +303,26 @@ export default class Tsbridge extends View {
       .child(v_flex().flex_1().min_w(0).gap(6).child(div().text_size(12.5).line_height("18px").child(text)).child(body ?? div()));
     const close = () => closeOverlay(props()?.overlay);
 
-    const bound = keys().filter((k) => k.action === "mod.open:tsbridge").map((k) => k.keys);
+    const bound = keys().filter((k) => k.action === "mod.open:remote").map((k) => k.keys);
     // keys.json ships cmd-alt-t (macOS) and ctrl-shift-y (Windows/Linux); show the one that works here.
     const shortcut = (win() ? bound.filter((k) => !k.startsWith("cmd-")) : [...bound.filter((k) => k.startsWith("cmd-")), ...bound])[0];
-    let root = v_flex().id("tsbridge").track_focus(this.handle)
+    let root = v_flex().id("remote").track_focus(this.handle)
       .on_key_down((e, cx) => { if (e.key === "escape") { close(); cx.stop_propagation(); } })
       .size_full().min_h(0).p(18).gap(10).bg(t.popover).text_color(t.foreground).text_size(13).overflow_y_scrollbar()
       .child(h_flex().items_center()
-        .child(div().flex_1().text_size(15).font_semibold().child("Tailcat bridge"))
+        .child(div().flex_1().text_size(15).font_semibold().child("Herdr Remote"))
         .child(div().id("ts-esc").px(6).py(2).rounded(5).text_size(11).text_color(t.dim).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click(close).child("Esc")))
       .child(muted("Use your other computers' terminals right here. No SSH or VPN needed."));
     const footer = div().pt(6).text_size(11.5).text_color(t.dim)
-      .child(shortcut ? `Open this again with ${shortcut}, or "Tailcat bridge" in the command palette.` : `Open this again from the command palette: "Tailcat bridge".`);
+      .child(shortcut ? `Open this again with ${shortcut}, or "Herdr Remote" in the command palette.` : `Open this again from the command palette: "Herdr Remote".`);
 
     if (!this.ready) {
       return root.child(
         v_flex().gap(10).p(14).rounded(9).bg(t.background).border_1().border_color(t.border)
           .child(div().text_size(13).font_semibold().child(this.stale ? "An update is needed" : "One-time setup"))
           .child(muted(this.stale
-            ? `This version of Tailcat bridge needs herdr-tsbridge ${VERSION}. Update replaces the one at ${this.bin}.`
-            : `Tailcat bridge needs a small helper program, herdr-tsbridge ${VERSION}. It's downloaded from GitHub, checked against a known checksum, and saved to ${this.bin}.`))
+            ? `This version of Herdr Remote needs herdr-remote ${VERSION}. Update replaces the one at ${this.bin}.`
+            : `Herdr Remote needs a small helper program, herdr-remote ${VERSION}. It's downloaded from GitHub, checked against a known checksum, and saved to ${this.bin}.`))
           .child(this.busy === "download" ? spin("Downloading… this can take a minute on a slow connection.")
             : h_flex().child(this.target ? button("download", this.stale ? "Update" : "Download", "primary", (cx) => this.act("setup", "download", () => this.download(), cx)) : spin("Checking…")))
           .child(note("setup")),
@@ -342,7 +345,7 @@ export default class Tsbridge extends View {
 
     if (this.adding === "form") {
       root = root.child(v_flex().gap(10).p(12).rounded(9).bg(t.background).border_1().border_color(t.border)
-        .child(step(1, "On the other computer, open Tailcat bridge and turn on Share this computer."))
+        .child(step(1, "On the other computer, open Herdr Remote and turn on Share this computer."))
         .child(step(2, "Copy the invite code it shows, and paste it here:", field(this.addrInput)))
         .child(step(3, "Name this computer:", field(this.nameInput)))
         .child(h_flex().gap(8).justify_end()

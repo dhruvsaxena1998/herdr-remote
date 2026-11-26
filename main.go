@@ -1,18 +1,17 @@
-// herdr-tsbridge lets hc (herdr-core) reach another machine, such as a Windows
+// herdr-remote lets hc (herdr-core) reach another machine, such as a Windows
 // VM, over Tailcat (Tailscale's data plane, no account) instead of SSH. The
 // serving side runs `herdr-core connect` for each allowlisted client; the
 // client side is a byte pipe that hc uses as its `machine add --via` transport.
 // See SECURITY.md before deploying.
 //
-//	Mac: herdr-tsbridge key                          (prints this machine's nodekey)
-//	VM:  herdr-tsbridge serve -allow nodekey:...     (prints a stable tc… address)
-//	Mac: hc machine add --via 'herdr-tsbridge pipe tc…' --name winvm
+//	Mac: herdr-remote key                          (prints this machine's nodekey)
+//	VM:  herdr-remote serve -allow nodekey:...     (prints a stable tc… address)
+//	Mac: hc machine add --via 'herdr-remote pipe tc…' --name winvm
 package main
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -54,13 +53,13 @@ func main() {
 	timeout := fs.Duration("timeout", 5*time.Minute, "how long to wait for approval (wait)")
 	fs.Parse(os.Args[2:])
 
-	// HERDR_TSBRIDGE_PROFILE keeps separate identities side by side, e.g. one per client site.
-	profile := os.Getenv("HERDR_TSBRIDGE_PROFILE")
+	// HERDR_REMOTE_PROFILE keeps separate identities side by side, e.g. one per client site.
+	profile := os.Getenv("HERDR_REMOTE_PROFILE")
 	if profile == "" {
 		profile = "default"
 	}
 	if !regexp.MustCompile(`^[a-z0-9-]{1,32}$`).MatchString(profile) {
-		log.Fatal("HERDR_TSBRIDGE_PROFILE must be 1-32 of a-z, 0-9, -")
+		log.Fatal("HERDR_REMOTE_PROFILE must be 1-32 of a-z, 0-9, -")
 	}
 
 	var err error
@@ -129,20 +128,20 @@ func main() {
 func usage(code int) {
 	fmt.Fprintln(os.Stderr, `usage:
 client side:
-  herdr-tsbridge key                     print this machine's client nodekey
-  herdr-tsbridge code                    print its short pairing code (shown on the server when it asks)
-  herdr-tsbridge wait [-timeout 5m] ADDRESS
+  herdr-remote key                     print this machine's client nodekey
+  herdr-remote code                    print its short pairing code (shown on the server when it asks)
+  herdr-remote wait [-timeout 5m] ADDRESS
                                          ask the server to connect; exit 0 once it's approved
-  herdr-tsbridge pipe ADDRESS [ignored...]
+  herdr-remote pipe ADDRESS [ignored...]
                                          stdin/stdout to the server (hc --via)
 server side:
-  herdr-tsbridge serve [-allow nodekey:...[,...]] [-herdr PATH] [-log FILE] [-max-conns N]
+  herdr-remote serve [-allow nodekey:...[,...]] [-herdr PATH] [-log FILE] [-max-conns N]
                                          serve herdr-core; unknown clients wait for approval
-  herdr-tsbridge addr                    print the saved server address (the invite; secret)
-  herdr-tsbridge clients                 JSON: clients asking to connect, and approved ones
-  herdr-tsbridge allow|deny|revoke KEY   approve, refuse, or remove a client (serve applies it live)
+  herdr-remote addr                    print the saved server address (the invite; secret)
+  herdr-remote clients                 JSON: clients asking to connect, and approved ones
+  herdr-remote allow|deny|revoke KEY   approve, refuse, or remove a client (serve applies it live)
 
-HERDR_TSBRIDGE_PROFILE=name keeps a separate set of keys (default: "default").`)
+HERDR_REMOTE_PROFILE=name keeps a separate set of keys (default: "default").`)
 	os.Exit(code)
 }
 
@@ -164,27 +163,9 @@ func serve(profile, allowList, herdr, logFile string, maxConns int) error {
 	if err != nil {
 		return err
 	}
-	g := newGate(clientsPath, pendingPath)
-	allow := &g.static
-	n := 0
-	for _, s := range strings.Split(allowList, ",") {
-		if s = strings.TrimSpace(s); s == "" {
-			continue
-		}
-		var k key.NodePublic
-		if err := k.UnmarshalText([]byte(s)); err != nil {
-			return fmt.Errorf("-allow %q: %w", s, err)
-		}
-		if !allow.Contains(k) {
-			allow.Add(k)
-			n++
-		}
-	}
-	if strings.TrimSpace(allowList) != "" && n == 0 {
-		return errors.New("-allow has no keys in it")
-	}
-	if maxConns < 1 {
-		return errors.New("-max-conns must be at least 1")
+	g, err := newGate(clientsPath, pendingPath, allowList, maxConns)
+	if err != nil {
+		return err
 	}
 
 	// Resolve once, so a later PATH change can't swap the program clients reach.
@@ -223,23 +204,9 @@ func serve(profile, allowList, herdr, logFile string, maxConns int) error {
 	}
 
 	run := s.ExecConnHandler([]string{herdrPath, "connect"})
-	slots := make(chan struct{}, maxConns)
 	handler := func(c net.Conn) {
 		peer, _ := s.PeerKey(c.RemoteAddr())
-		select {
-		case slots <- struct{}{}:
-		default:
-			log.Printf("rejected connection from %s: %d already open", peer, maxConns)
-			c.Close()
-			return
-		}
-		defer func() { <-slots }()
-		g.track(peer, c, true)
-		defer g.track(peer, c, false)
-		start := time.Now()
-		log.Printf("open %s", peer)
-		run(c)
-		log.Printf("close %s after %s", peer, time.Since(start).Round(time.Second))
+		g.serveConn(peer, c, run)
 	}
 	s.OnTCP = func(p uint16) func(net.Conn) {
 		if p == port {
@@ -269,26 +236,14 @@ func serve(profile, allowList, herdr, logFile string, maxConns int) error {
 			return err
 		}
 	}
-	log.Printf("serving %s connect; %d client(s) from -allow, approved ones from %s", herdrPath, n, clientsPath)
+	log.Printf("serving %s connect; %d client(s) from -allow, approved ones from %s", herdrPath, g.nStatic, clientsPath)
 	fmt.Println("address (secret, share only with the client machine):", addr)
-	defer os.Remove(pendingPath) // nobody is asking once serve is gone
 	// Return on Ctrl-C / hc kill (SIGHUP, then SIGTERM) so the deferred closes run and the log records the stop.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGHUP, syscall.SIGTERM)
 	defer stop()
-	tick := time.NewTicker(time.Second)
-	defer tick.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("stopping")
-			return nil
-		case <-tick.C:
-			if err := g.reload(s.DisconnectClient); err != nil {
-				log.Printf("reading %s: %v (keeping the previous list)", clientsPath, err)
-			}
-			g.flushPending()
-		}
-	}
+	g.run(ctx, s.DisconnectClient)
+	log.Printf("stopping")
+	return nil
 }
 
 // printClients prints, as JSON, who is asking to connect (while serve runs) and who is approved.

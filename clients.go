@@ -8,6 +8,7 @@ package main
 // address too: its pre-shared key is checked in the WireGuard handshake.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -54,7 +55,7 @@ func statePath(profile, kind string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "herdr-tsbridge", profile+"-"+kind+".json"), nil
+	return filepath.Join(dir, "herdr-remote", profile+"-"+kind+".json"), nil
 }
 
 func readJSON(path string, v any) error {
@@ -124,11 +125,13 @@ func editClients(path, op string, k key.NodePublic) error {
 type pendingReq struct{ since, seen time.Time }
 
 // gate decides admission for serve: keys from -allow, plus the clients file,
-// re-read when it changes. It also tracks open connections so a revoked
-// client's sessions can be closed.
+// re-read when it changes. It also owns the open connections: it caps how
+// many run at once and closes a revoked client's sessions.
 type gate struct {
 	static                   tailcat.KeySet
+	nStatic                  int
 	clientsPath, pendingPath string
+	slots                    chan struct{}
 
 	mu      sync.Mutex
 	allow   map[key.NodePublic]bool
@@ -140,13 +143,34 @@ type gate struct {
 	conns   map[key.NodePublic]map[net.Conn]bool
 }
 
-func newGate(clientsPath, pendingPath string) *gate {
-	return &gate{
-		clientsPath: clientsPath, pendingPath: pendingPath,
+// newGate checks serve's -allow list (comma-separated nodekeys) and -max-conns.
+func newGate(clientsPath, pendingPath, allowList string, maxConns int) (*gate, error) {
+	if maxConns < 1 {
+		return nil, errors.New("-max-conns must be at least 1")
+	}
+	g := &gate{
+		clientsPath: clientsPath, pendingPath: pendingPath, slots: make(chan struct{}, maxConns),
 		allow: map[key.NodePublic]bool{}, deny: map[key.NodePublic]bool{},
 		pending: map[key.NodePublic]*pendingReq{}, logged: map[key.NodePublic]bool{},
 		conns: map[key.NodePublic]map[net.Conn]bool{}, dirty: true, stamp: "unread",
 	}
+	for _, s := range strings.Split(allowList, ",") {
+		if s = strings.TrimSpace(s); s == "" {
+			continue
+		}
+		var k key.NodePublic
+		if err := k.UnmarshalText([]byte(s)); err != nil {
+			return nil, fmt.Errorf("-allow %q: %w", s, err)
+		}
+		if !g.static.Contains(k) {
+			g.static.Add(k)
+			g.nStatic++
+		}
+	}
+	if strings.TrimSpace(allowList) != "" && g.nStatic == 0 {
+		return nil, errors.New("-allow has no keys in it")
+	}
+	return g, nil
 }
 
 func (g *gate) admit(k key.NodePublic) bool {
@@ -271,6 +295,44 @@ func (g *gate) flushPending() {
 	sort.Slice(list, func(i, j int) bool { return list[i].Since.Before(list[j].Since) })
 	if err := writeJSON(g.pendingPath, list); err != nil {
 		log.Printf("writing %s: %v", g.pendingPath, err)
+	}
+}
+
+// serveConn runs one admitted connection, if a slot is free, and tracks it
+// so that revoking peer closes it.
+func (g *gate) serveConn(peer key.NodePublic, c net.Conn, run func(net.Conn)) {
+	select {
+	case g.slots <- struct{}{}:
+	default:
+		log.Printf("rejected connection from %s: %d already open", peer, cap(g.slots))
+		c.Close()
+		return
+	}
+	defer func() { <-g.slots }()
+	g.track(peer, c, true)
+	defer g.track(peer, c, false)
+	start := time.Now()
+	log.Printf("open %s", peer)
+	run(c)
+	log.Printf("close %s after %s", peer, time.Since(start).Round(time.Second))
+}
+
+// run keeps the lists current, once a second, until ctx ends. Call reload
+// once before the server starts, so approved clients are known from the first handshake.
+func (g *gate) run(ctx context.Context, disconnect func(key.NodePublic) bool) {
+	defer os.Remove(g.pendingPath) // nobody is asking once serve is gone
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			if err := g.reload(disconnect); err != nil {
+				log.Printf("reading %s: %v (keeping the previous list)", g.clientsPath, err)
+			}
+			g.flushPending()
+		}
 	}
 }
 

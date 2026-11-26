@@ -11,7 +11,7 @@ import (
 
 // Secrets live in the login Keychain. Values go to `security` on stdin
 // (interactive mode), never argv, so they don't show up in ps.
-const keychainService = "herdr-tsbridge"
+const keychainService = "herdr-remote"
 
 func loadSecret(name string) ([]byte, bool, error) {
 	out, err := exec.Command("/usr/bin/security", "find-generic-password",

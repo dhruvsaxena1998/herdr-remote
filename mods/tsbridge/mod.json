@@ -1,6 +1,0 @@
-{
-  "place": "none",
-  "title": "Tailcat bridge",
-  "overlay": { "kind": "dialog", "width": 600, "height": 560 },
-  "palette": [{ "title": "Tailcat bridge", "command": "mod.open", "args": { "name": "tsbridge" }, "words": "tailscale tsbridge remote machine share connect" }]
-}

@@ -15,7 +15,7 @@ func secretPath(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "herdr-tsbridge", name), nil
+	return filepath.Join(dir, "herdr-remote", name), nil
 }
 
 func loadSecret(name string) ([]byte, bool, error) {

@@ -1,0 +1,6 @@
+{
+  "place": "none",
+  "title": "Herdr Remote",
+  "overlay": { "kind": "dialog", "width": 600, "height": 560 },
+  "palette": [{ "title": "Herdr Remote", "command": "mod.open", "args": { "name": "remote" }, "words": "tailscale tailcat remote machine share connect" }]
+}

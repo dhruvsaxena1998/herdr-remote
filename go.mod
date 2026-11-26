@@ -1,4 +1,4 @@
-module github.com/dhruvsaxena1998/herdr-tsbridge
+module github.com/dhruvsaxena1998/herdr-remote
 
 go 1.27.4
 

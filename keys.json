@@ -1,6 +1,6 @@
 {
   "global": {
-    "cmd-alt-t": "mod.open:tsbridge",
-    "ctrl-shift-y": "mod.open:tsbridge"
+    "cmd-alt-t": "mod.open:remote",
+    "ctrl-shift-y": "mod.open:remote"
   }
 }
