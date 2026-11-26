@@ -90,7 +90,8 @@ export default class Tsbridge extends View {
 
   async download() {
     const name = `herdr-tsbridge-${this.target}${win() ? ".exe" : ""}`;
-    await exec("curl", ["-fsSL", "--create-dirs", "-o", this.bin, URL + name], { timeout: 180000 }).then(out);
+    await exec("curl", ["-fsSL", "--create-dirs", "-o", this.bin, URL + name], { timeout: 180000 }).then(out)
+      .catch((e) => Promise.reject(new Error(`${e.message} (${URL + name})`)));
     if (!win()) await exec("chmod", ["755", this.bin]).then(out);
     if ((await sha256(this.bin)) !== SHA256[this.target]) throw new Error("The download's SHA-256 doesn't match; not using it.");
     await this.check();
