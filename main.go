@@ -12,6 +12,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -85,6 +86,19 @@ func main() {
 		err = wait(profile+"-client", fs.Arg(0), *timeout)
 	case "clients":
 		err = printClients(profile)
+	case "offer":
+		var addr tailcat.Addr
+		if addr, err = savedAddr(profile + "-server"); err == nil {
+			err = offer(addr, offerTTL)
+		}
+	case "redeem":
+		if fs.NArg() < 1 {
+			usage(2)
+		}
+		var addr tailcat.Addr
+		if addr, err = redeem(strings.Join(fs.Args(), " "), redeemTimeout); err == nil {
+			fmt.Println(addr)
+		}
 	case "allow", "deny", "revoke":
 		if fs.NArg() < 1 {
 			usage(2)
@@ -97,15 +111,10 @@ func main() {
 			}
 		}
 	case "addr":
-		id, saved, err := loadIdentity(profile + "-server")
-		if err != nil {
-			log.Fatal(err)
+		var addr tailcat.Addr
+		if addr, err = savedAddr(profile + "-server"); err == nil {
+			fmt.Println(addr)
 		}
-		if !saved {
-			log.Fatal("no server identity yet: run serve once")
-		}
-		fmt.Println(id.Public.Addr())
-		return
 	case "serve":
 		err = serve(profile, *allow, *herdr, *logFile, *maxConns)
 	case "pipe":
@@ -132,12 +141,14 @@ client side:
   herdr-remote code                    print its short pairing code (shown on the server when it asks)
   herdr-remote wait [-timeout 5m] ADDRESS
                                          ask the server to connect; exit 0 once it's approved
+  herdr-remote redeem CODE             print the invite sent with a one-time code
   herdr-remote pipe ADDRESS [ignored...]
                                          stdin/stdout to the server (hc --via)
 server side:
   herdr-remote serve [-allow nodekey:...[,...]] [-herdr PATH] [-log FILE] [-max-conns N]
                                          serve herdr-core; unknown clients wait for approval
   herdr-remote addr                    print the saved server address (the invite; secret)
+  herdr-remote offer                   print a one-time code that delivers the invite once (10 min)
   herdr-remote clients                 JSON: clients asking to connect, and approved ones
   herdr-remote allow|deny|revoke KEY   approve, refuse, or remove a client (serve applies it live)
 
@@ -322,6 +333,18 @@ func loadIdentity(name string) (id tailcat.PrivateKey, saved bool, err error) {
 		return id, true, fmt.Errorf("stored server identity %q is incomplete; refusing to start", name)
 	}
 	return id, true, nil
+}
+
+// savedAddr is the invite of the saved server identity.
+func savedAddr(name string) (tailcat.Addr, error) {
+	id, saved, err := loadIdentity(name)
+	if err != nil {
+		return "", err
+	}
+	if !saved {
+		return "", errors.New("no server identity yet: run serve once")
+	}
+	return id.Public.Addr(), nil
 }
 
 // pipe connects stdin/stdout to the server's herdr-core, until the server side ends.

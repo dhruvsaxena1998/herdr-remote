@@ -4,7 +4,8 @@
 // "Share this computer" runs `herdr-remote serve` as a herdr-core terminal,
 // so it outlives this window. Pairing takes one string: the sharing side's
 // invite code goes to the other computer, which asks to connect; the sharing
-// side approves it by its short pairing code. Opened with
+// side approves it by its short pairing code. Without a shared clipboard, a
+// one-time code (`offer`/`redeem`) carries the invite instead. Opened with
 // `mod.open {name: "remote"}`, the command palette, or the key in keys.json.
 
 import { View, div, svg } from "gpui-kit";
@@ -12,26 +13,29 @@ import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { exec, hc, home, theme, checking, keys, props, closeOverlay } from "herdr";
 
 // Pinned release. A binary runs only after its SHA-256 matches this table.
-const VERSION = "v0.3.0";
+const VERSION = "v0.4.0";
 const SHA256 = {
-  "darwin-amd64": "c0b1d52f790ea9e17d5ab71f23b4aff72dad5d1b6724a3b7f7dd969c4a4d4b7d",
-  "darwin-arm64": "a3db2876a702ec4b2429a620f6437b3efeb4d8291a39c87c90fa92c090aa41cb",
-  "linux-amd64": "439743e0b1b303e66ba91782fc26b3047a21470b83cba1744498687029651c8b",
-  "linux-arm64": "c86aededdcf6f08533e77e2a059812fecfc11cefdd52feff3f90e24017d6fe97",
-  "windows-amd64": "3ed6ff3d36723f38d4a5542c5dc86a0594739ade6c316548e86c86a7d891bfe6",
-  "windows-arm64": "525e12e43e60fca677291ae85fdfee3a54b1b181d946e9ea31a1d678c226080b",
+  "darwin-amd64": "4c9b73d537c20027f2e6de00b3bd80b3b73d54d2a78396a024fd2eb77a0133b0",
+  "darwin-arm64": "99b3640e1a6361c174e29acad591c19175168ff6b8c09e69356ef58b0ed45cdb",
+  "linux-amd64": "70b5aadbdf9841fcf03519cb8b07fdde7224ebb21ee1447e0ad90feabbeb2b47",
+  "linux-arm64": "28cfd79e34d141bceb7c544ed7797bfd3fa0dec13e9828c5d6e20c3272df0f43",
+  "windows-amd64": "12ac584c0071a5329069b003fc499f208c4362ac1a92a8dccb8da8f8ff2a4a5e",
+  "windows-arm64": "d1d2305191408818b973253eea84c1dea01ae4d65ce0c3afc176ff13a5bfc3be",
 };
 const REPO = "https://github.com/dhruvsaxena1998/herdr-remote";
 const URL = `${REPO}/releases/download/${VERSION}/`;
 const SERVE = "remote-serve"; // the herdr-core terminal running serve
+const OFFER = "remote-offer"; // the one running offer, while a one-time code is out
 const I = (name) => `mods/workspace-chrome/${name}.svg`; // Herdr's shipped icons
 
 const ADDR_RE = /^tc[A-Za-z0-9_-]+$/; // base64url: safe inside the --via line unquoted
 const NAME_RE = /^[a-z0-9-]{1,32}$/;
 const KEY_RE = /^nodekey:[0-9a-f]{64}$/;
+const CODE_RE = /^[A-HJ-NP-Z2-9]{4}[- ]?[A-HJ-NP-Z2-9]{4}$/i; // a one-time code, like WDJB-MJHT
 
 const win = () => /^[a-z]:[\\/]/i.test(home()); // window() is null during checks
-const out = (r) => (r.code === 0 ? r.stdout.trim() : Promise.reject(new Error((r.stderr || r.stdout).trim().replace(/^\d{4}\/\d\d\/\d\d \d\d:\d\d:\d\d /, "") || `exit ${r.code}`)));
+const unstamp = (s) => s.replace(/^\d{4}\/\d\d\/\d\d \d\d:\d\d:\d\d /, ""); // log.Fatal's timestamp
+const out = (r) => (r.code === 0 ? r.stdout.trim() : Promise.reject(new Error(unstamp((r.stderr || r.stdout).trim()) || `exit ${r.code}`)));
 const isOurs = (m) => typeof m.target === "string" && m.target.includes("herdr-remote") && m.target.includes(" pipe ");
 const day = (iso) => { const d = new Date(iso); return `${"Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(" ")[d.getMonth()]} ${d.getDate()}`; }; // toLocaleDateString ignores options here
 
@@ -63,14 +67,18 @@ export default class Remote extends View {
     this.msg = {}; // section -> { text, error }
     this.code = null; // this computer's pairing code
     this.machines = []; // computers added through this bridge
-    this.adding = null; // null | "form" | { name, token } while waiting for approval
+    this.adding = null; // null | "form" | { name, token, fetching } while redeeming a code, then waiting for approval
     this.serve = null; // { live, tail } of the serve terminal
     this.addr = null; // the invite code while sharing
+    this.offer = null; // { code } while a one-time code is out (code is null until it's printed)
+    this.offering = false; // this window started the offer, so it reports how it ended
+    this.offerGen = 0; // bumped on start/cancel, so a refresh begun before then ignores what it read
+    this.redeemed = {}; // one-time code -> its redeem promise: a code works once, so a retry after Cancel reuses it
     this.clients = { pending: [], allow: [] };
     this.confirm = null; // id of a Remove button waiting for its second click
     this.handle = cx.focus_handle();
     this.handle.focus();
-    this.addrInput = InputState.new({ placeholder: "Paste the invite code (starts with tc)" });
+    this.addrInput = InputState.new({ placeholder: "Paste the invite code, or type the one-time code" });
     this.nameInput = InputState.new({ placeholder: "e.g. work-pc" });
     this.nameInput.on("submit", (_e, cx) => this.connect(cx));
     if (checking()) return;
@@ -133,10 +141,12 @@ export default class Remote extends View {
   }
 
   async refresh() {
-    const [r, ms, cl] = await Promise.all([
+    const gen = this.offerGen;
+    const [r, ms, cl, of] = await Promise.all([
       hc(["get", SERVE, "--json"]).catch(() => null),
       hc(["machine", "ls", "--json"]).catch(() => null),
       exec(this.bin, ["clients"]).catch(() => null),
+      hc(["get", OFFER, "--json"]).catch(() => null),
     ]);
     try {
       if (ms?.code === 0) this.machines = (JSON.parse(ms.stdout).machines ?? []).filter((m) => !m.temporary && isOurs(m));
@@ -155,6 +165,24 @@ export default class Remote extends View {
     // The identity is saved a moment after serve starts; ask until it is.
     if (live && !this.addr && !this.stopped) this.addr = await exec(this.bin, ["addr"]).then(out).catch(() => null);
     if (!live) this.addr = null;
+
+    let o = null;
+    try {
+      o = of?.code === 0 ? JSON.parse(of.stdout) : null;
+    } catch {}
+    if (gen !== this.offerGen) return; // an offer started or was cancelled meanwhile; the next refresh reads it
+    if (o && (o.state === "live" || this.offering)) {
+      const screen = (await hc(["read", OFFER, "--lines", "20"]).then(out).catch(() => "")).split("\n").filter((l) => l.trim());
+      if (gen !== this.offerGen) return;
+      if (o.state === "live") this.offer = { code: screen.join("\n").match(/one-time code: (\S+)/)?.[1] ?? null };
+      else {
+        this.offer = null;
+        this.offering = false;
+        const why = unstamp(screen.at(-1)?.trim() ?? `exit ${o.exit_code}`);
+        if (o.exit_code === 0) this.say("share", "Sent. When the other computer asks to connect, check the pairing code matches and click Allow.", true);
+        else if (!this.offerCancelled) this.say("share", `One-time code: ${why}`);
+      }
+    } else this.offer = null;
   }
 
   // Runs one action, reporting into its section.
@@ -185,17 +213,32 @@ export default class Remote extends View {
   }
 
   connect(cx) {
-    const addr = this.addrInput.value().trim();
+    const input = this.addrInput.value().trim();
     const name = this.nameInput.value().trim().toLowerCase();
-    if (!ADDR_RE.test(addr)) return this.say("mine", "That doesn't look like an invite code. Copy it from Share this computer on the other computer; it starts with tc."), cx.notify();
+    const isCode = CODE_RE.test(input);
+    if (!isCode && !ADDR_RE.test(input)) return this.say("mine", "That doesn't look like an invite code (starts with tc) or a one-time code (like WDJB-MJHT). Get one from Share this computer on the other computer."), cx.notify();
     if (!NAME_RE.test(name)) return this.say("mine", "Give it a short name using letters, numbers or dashes, like work-pc."), cx.notify();
     if (this.machines.some((m) => m.name === name)) return this.say("mine", `You already have a computer called ${name}. Pick another name.`), cx.notify();
     const token = {};
-    this.adding = { name, token };
+    this.adding = { name, token, fetching: isCode };
     this.say("mine", null);
     cx.notify();
     cx.spawn(async (cx) => {
       try {
+        let addr = input;
+        if (isCode) {
+          // Shared by a retry after Cancel: the first redeem uses the code up either way.
+          const key = input.toUpperCase().replace(/[- ]/g, "");
+          if (!this.redeemed[key]) {
+            this.redeemed[key] = exec(this.bin, ["redeem", input], { timeout: 70000 }).then(out);
+            this.redeemed[key].catch(() => delete this.redeemed[key]);
+          }
+          addr = await this.redeemed[key];
+        }
+        if (this.adding?.token !== token) return; // cancelled
+        if (!ADDR_RE.test(addr)) throw new Error("The other computer sent something that isn't an invite code.");
+        this.adding.fetching = false;
+        cx.notify();
         // Keeps asking until the other computer clicks Allow (or 5 minutes pass).
         // shortcut: Cancel only stops listening; the wait process runs out its 5 minutes. Kill it if that ever matters.
         await exec(this.bin, ["wait", addr], { timeout: 330000 }).then(out);
@@ -252,10 +295,31 @@ export default class Remote extends View {
       this.act("share", "share", async () => {
         this.stopped = true; // its exit isn't an error to show
         this.addr = null;
+        await this.cancelOffer(); // even if this window isn't showing it, it must not outlive sharing
         await hc(["kill", SERVE]).then(out);
         await this.refresh();
       }, cx);
     }
+  }
+
+  startOffer(cx) {
+    this.act("share", "offer", async () => {
+      this.offerGen++;
+      await hc(["rm", OFFER]).catch(() => null); // a finished one keeps the name
+      await hc(["run", "--bg", "--no-parent", "--name", OFFER, "--", this.bin, "offer"]).then(out);
+      this.offerGen++;
+      this.offering = true;
+      this.offerCancelled = false;
+      this.offer = { code: null };
+      await this.refresh();
+    }, cx);
+  }
+
+  async cancelOffer() {
+    this.offerGen++;
+    this.offerCancelled = true; // its exit isn't an error to show
+    this.offer = null;
+    await hc(["kill", OFFER]).catch(() => null);
   }
 
   client(op, entry, cx) {
@@ -346,11 +410,15 @@ export default class Remote extends View {
     if (this.adding === "form") {
       root = root.child(v_flex().gap(10).p(12).rounded(9).bg(t.background).border_1().border_color(t.border)
         .child(step(1, "On the other computer, open Herdr Remote and turn on Share this computer."))
-        .child(step(2, "Copy the invite code it shows, and paste it here:", field(this.addrInput)))
+        .child(step(2, "Paste the invite code it shows here. No copy-paste between them? Click Get a one-time code there, and type that code instead:", field(this.addrInput)))
         .child(step(3, "Name this computer:", field(this.nameInput)))
         .child(h_flex().gap(8).justify_end()
           .child(button("add-cancel", "Cancel", null, (cx) => { this.adding = null; this.say("mine", null); cx.notify(); }))
           .child(button("add-go", "Connect", "primary", (cx) => this.connect(cx)))));
+    } else if (this.adding?.fetching) {
+      root = root.child(v_flex().gap(10).p(14).rounded(9).bg(t.background).border_1().border_color(t.accent).items_center()
+        .child(spin("Getting the invite with the one-time code…"))
+        .child(button("fetch-cancel", "Cancel", null, (cx) => { this.adding = "form"; cx.notify(); })));
     } else if (this.adding) {
       root = root.child(v_flex().gap(10).p(14).rounded(9).bg(t.background).border_1().border_color(t.accent).items_center()
         .child(spin(`Waiting for the other computer to allow ${this.adding.name}…`))
@@ -379,8 +447,16 @@ export default class Remote extends View {
           .child("Computers you allow can do anything you can do on this computer.")
           .child(div().id("ts-sec").text_color(t.accent).cursor_pointer().hover((st) => st.underline()).on_click((_e, cx) => cx.open_url(`${REPO}/blob/main/SECURITY.md`)).child("Security notes")))
         .child(step(1, "Copy this invite code and paste it on the computer that will connect. Keep it private, like a password.",
-          this.addr ? h_flex().gap(8).child(mono(this.addr)).child(copyBtn("copy-addr", this.addr)) : spin("Getting the invite code…")))
-        .child(step(2, "When it asks to connect, check the code matches and click Allow.",
+          this.addr ? v_flex().gap(8)
+            .child(h_flex().gap(8).child(mono(this.addr)).child(copyBtn("copy-addr", this.addr)))
+            .child(this.offer
+              ? v_flex().gap(8).p(12).rounded(8).bg(t.background).border_1().border_color(t.accent).items_center()
+                .child(this.offer.code ? div().px(16).py(8).rounded(8).bg(t.raised).border_1().border_color(t.border).text_size(22).font_semibold().child(this.offer.code) : spin("Getting a one-time code…"))
+                .child(muted("Type this on the other computer, in Add a computer. It works once, for 10 minutes."))
+                .child(button("offer-cancel", "Cancel", null, (cx) => this.act("share", "offer-cancel", () => this.cancelOffer(), cx)))
+              : h_flex().gap(8).items_center().child(muted("No copy-paste on the other computer?")).child(button("offer", "Get a one-time code", null, (cx) => this.startOffer(cx))))
+            : spin("Getting the invite code…")))
+        .child(step(2, "When it asks to connect, check the pairing code matches and click Allow.",
           pending.length
             ? v_flex().gap(6).children(pending.map((p) => v_flex().gap(8).px(12).py(10).rounded(8).bg(t.background).border_1().border_color(t.accent)
                 .child(h_flex().gap(10).items_center()

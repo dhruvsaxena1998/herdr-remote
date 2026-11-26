@@ -16,6 +16,10 @@ _Avoid_: Mac, local, controller
 The sharing side's long-lived, secret `tc…` address; a connecting side needs it to reach the sharing side at all.
 _Avoid_: address (in user-facing text), token, link
 
+**One-time code**:
+Eight characters like `WDJB-MJHT` that deliver the invite to one computer, once, within 10 minutes; for computers with no shared clipboard.
+_Avoid_: PIN, short code, wormhole code (and don't confuse it with the pairing code)
+
 **Pairing code**:
 A short fingerprint of a connecting side's key, shown on both computers so a person can tell a request is their own computer's.
 _Avoid_: PIN, verification code
