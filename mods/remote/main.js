@@ -22,7 +22,7 @@ const SHA256 = {
   "windows-arm64": "525e12e43e60fca677291ae85fdfee3a54b1b181d946e9ea31a1d678c226080b",
 };
 const REPO = "https://github.com/dhruvsaxena1998/herdr-remote";
-const URL = `${REPO}/releases/download/${VERSION}/herdr-remote-`;
+const URL = `${REPO}/releases/download/${VERSION}/`;
 const SERVE = "remote-serve"; // the herdr-core terminal running serve
 const I = (name) => `mods/workspace-chrome/${name}.svg`; // Herdr's shipped icons
 
